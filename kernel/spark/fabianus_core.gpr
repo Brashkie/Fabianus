@@ -1,0 +1,37 @@
+project Fabianus_Core is
+
+   for Target use "riscv64-elf";
+   for Runtime ("Ada") use project'Project_Dir & "rts";
+   for Languages use ("Ada");
+   for Source_Dirs use ("src");
+   for Object_Dir use "obj";
+   for Library_Dir use "lib";
+   for Library_Name use "fabianus_core";
+   for Library_Kind use "static";
+
+   package Builder is
+      for Global_Configuration_Pragmas use "gnat.adc";
+      --  Parámetros reales de riscv64 para que GNATprove razone sobre el objetivo.
+      for Global_Compilation_Switches ("Ada") use
+        ("-gnateT=" & project'Project_Dir & "target.atp");
+   end Builder;
+
+   package Compiler is
+      --  -gnatp quita las comprobaciones en tiempo de ejecución: GNATprove
+      --  demuestra que no pueden fallar. No compilar sin haber pasado la prueba.
+      for Default_Switches ("Ada") use
+        ("-O2", "-gnatp", "-gnatn", "-gnat2022",
+         "-march=rv64imac_zicsr_zifencei", "-mabi=lp64", "-mcmodel=medany",
+         "-ffunction-sections", "-fdata-sections");
+   end Compiler;
+
+   package Prove is
+      for Proof_Switches ("Ada") use
+        ("--level=2", "--mode=all", "--checks-as-errors=on", "--warnings=error");
+      --  La búsqueda de bits necesita más tiempo de los probadores.
+      for Proof_Switches ("frame_bitmap.adb") use ("--level=4");
+      --  Invariante con cuantificadores anidados sobre todas las tablas.
+      for Proof_Switches ("user_space.adb") use ("--level=2");
+   end Prove;
+
+end Fabianus_Core;

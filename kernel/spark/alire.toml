@@ -1,0 +1,11 @@
+name = "fabianus_core"
+description = "Nucleo verificado de Fabianus en SPARK"
+version = "0.1.0"
+authors = ["Fabianus"]
+maintainers = ["Fabianus <noreply@example.invalid>"]
+maintainers-logins = ["fabianus"]
+project-files = ["fabianus_core.gpr"]
+
+[[depends-on]]
+gnat_riscv64_elf = "*"
+gnatprove = "*"

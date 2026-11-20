@@ -1,0 +1,11 @@
+# Build outputs
+.zig-cache/
+zig-out/
+kernel/spark/obj/
+kernel/spark/lib/
+kernel/spark/alire/
+
+# Leftovers from the `zig init` template at the root (the kernel lives in kernel/)
+/build.zig
+/build.zig.zon
+/src/
