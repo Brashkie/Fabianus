@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Procesos de usuario: un espacio de direcciones propio y un hilo que lo ejecuta.
 
 const abi = @import("abi.zig").c;
@@ -10,6 +11,7 @@ const riscv = @import("riscv.zig");
 const thread = @import("thread.zig");
 const hart = @import("hart.zig");
 const ipi = @import("ipi.zig");
+const kernel_lock = @import("kernel_lock.zig");
 
 const page_size: u64 = abi.FB_PAGE_SIZE;
 const user_base: u64 = abi.FB_USER_BASE;
@@ -98,6 +100,22 @@ pub const Program = enum(usize) {
     bench_xcall,
     bench_xserve,
     call_server_spin,
+    shm_writer,
+    shm_reader,
+    shm_store,
+    shm_map_status,
+    shm_map_twice,
+    shm_giver,
+    shm_taker,
+    bench_shm_produce,
+    bench_shm_consume,
+    bench_copy_produce,
+    bench_copy_consume,
+    bench_shm_map,
+    disk_driver,
+    disk_check,
+    dma_status,
+    bench_disk,
 };
 
 /// Capability que el kernel concede a un proceso al crearlo.
@@ -166,6 +184,8 @@ fn destroySpace(space: u64) void {
     device.release(space);
     if (abi.fb_cap_clear(space) != abi.FB_CAP_OK) @panic("no se pudieron borrar las capabilities");
     if (abi.fb_uspace_destroy(space) != abi.FB_USPACE_OK) @panic("no se pudo destruir el espacio");
+    // Quizá era el último que alcanzaba alguna región compartida.
+    @import("region.zig").reclaim();
 }
 
 fn userMain(argument: u64) callconv(.c) void {
@@ -233,7 +253,12 @@ pub fn resultOf(id: u64) Result {
 pub fn requestKill(id: u64) void {
     const saved = riscv.disableInterruptsSaving();
     defer riscv.restoreInterrupts(saved);
+    // Con el global, como las llamadas al sistema: el proceso, o ya espera y
+    // aquí se cancela su espera, o aún no ha entrado y verá la orden al entrar.
+    kernel_lock.enter();
+    defer kernel_lock.leave();
     @atomicStore(bool, &kill_flags[id], true, .seq_cst);
+    @atomicStore(u64, @import("trap.zig").killWord(thread.trapStack(id).top), 1, .monotonic);
     const server = abi.fb_ipc_waits_for(id);
     if (abi.fb_ipc_cancel(id) == abi.FB_IPC_OK) {
         thread.unblock(id);
@@ -254,6 +279,13 @@ pub fn killFlag(id: u64) bool {
 
 pub fn killRequested() bool {
     return @atomicLoad(bool, &kill_flags[thread.currentId()], .seq_cst);
+}
+
+/// Lo mismo al entrar una llamada al sistema, con el cerrojo global tomado:
+/// requestKill escribe con él, así que basta una lectura sin barreras, y la
+/// palabra está justo encima del marco del trap (trap.killWord).
+pub inline fn killRequestedAt(frame: *const abi.fb_trap_frame) bool {
+    return @atomicLoad(u64, @import("trap.zig").killWordOfFrame(frame), .monotonic) != 0;
 }
 
 /// Termina el proceso actual desde su trap. Sus tablas siguen activas hasta aquí,

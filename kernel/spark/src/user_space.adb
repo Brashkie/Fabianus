@@ -1,7 +1,8 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 package body User_Space with
   SPARK_Mode,
   Refined_State =>
-    (State => (Pool, Info, Owner, List, Count_Of, Slot_Of, Device_Owner, Kernel, Pool_Ppn, Frame_Base, Frame_Count, Ready))
+    (State => (Pool, Info, Owner, List, Count_Of, Slot_Of, Device_Owner, Attached, Kernel, Pool_Ppn, Frame_Base, Frame_Count, Ready))
 is
    use type Frame_Gate.U64;
 
@@ -31,6 +32,16 @@ is
    type Frame_Number is range 0 .. Max_Frames - 1;
    type Owner_Map is array (Frame_Number) of Owner_Tag;
 
+   --  Qué espacios están unidos a cada región.
+   type Attach_Map is array (Region_Tag, Space_Id) of Boolean;
+
+   --  Lo que un espacio puede tener mapeado además de sus marcos: el
+   --  dispositivo, si es suyo, y las regiones a las que está unido.
+   type Access_Rights is record
+      Dev   : Device_Map;
+      Links : Attach_Map;
+   end record;
+
    Empty_Tables : constant Space_Tables := (others => (others => 0));
    Empty_Info   : constant Space_Info :=
      (Active => False, Mid_Used => 0, Leaf_Used => 0);
@@ -52,14 +63,15 @@ is
    type Owned_Count is range 0 .. Max_Owned;
    subtype Owned_Index is Owned_Count range 1 .. Max_Owned;
    type Frame_List is array (Owned_Index) of Frame_Number;
-   type List_Map is array (Space_Id) of Frame_List;
-   type Count_Map is array (Space_Id) of Owned_Count;
+   type List_Map is array (Holder_Id) of Frame_List;
+   type Count_Map is array (Holder_Id) of Owned_Count;
    type Slot_Map is array (Frame_Number) of Owned_Count;
 
    List     : List_Map := (others => (others => 0));
    Count_Of : Count_Map := (others => 0);
    Slot_Of  : Slot_Map := (others => 0);
-   Device_Owner : Owner_Tag := No_Owner;
+   Device_Owner : Device_Map := (others => No_Owner);
+   Attached : Attach_Map := (others => (others => False));
    Kernel : Kernel_Root := (others => 0);
    Pool_Ppn : U64 := 0;
    Frame_Base : U64 := 0;
@@ -135,20 +147,27 @@ is
      Ghost,
      Annotate => (GNATprove, Hide_Info, "Expression_Function_Body");
 
-   --  Página que S puede tener mapeada: un marco suyo o el dispositivo si es suyo.
+   --  S puede usar un marco de este dueño: es S, o una región a la que S está
+   --  unido.
+   function Uses (Tag : Owner_Tag; S : Space_Id; Dev : Access_Rights) return Boolean is
+     (Tag = S or else (Tag in Region_Tag and then Dev.Links (Tag, S)))
+   with Ghost;
+
+   --  Página que S puede tener mapeada: un marco suyo o de una región a la que
+   --  está unido, o el dispositivo si es suyo.
    function Owned_Ppn
      (Ppn   : U64;
       S     : Space_Id;
       Base  : U64;
       Count : U64;
       O     : Owner_Map;
-      Dev   : Owner_Tag) return Boolean
+      Dev   : Access_Rights) return Boolean
    is
-     ((Ppn = Device_Ppn and then Dev = S)
+     ((for some D in Device_Id => Ppn = Device_Ppn (D) and then Dev.Dev (D) = S)
       or else
         (Frame_In (Ppn, Base, Count)
          and then Ppn - Base < U64 (Max_Frames)
-         and then O (Frame_Number (Ppn - Base)) = S))
+         and then Uses (O (Frame_Number (Ppn - Base)), S, Dev)))
    with Ghost;
 
    --  Cada hoja apunta a una página cuyo dueño es este espacio.
@@ -158,7 +177,7 @@ is
       Base  : U64;
       Count : U64;
       O     : Owner_Map;
-      Dev : Owner_Tag) return Boolean
+      Dev : Access_Rights) return Boolean
    is
      (for all X in Leaf_Slot =>
         (for all E in Entry_Index =>
@@ -168,6 +187,10 @@ is
      Ghost,
      Annotate => (GNATprove, Hide_Info, "Expression_Function_Body");
 
+   function Rights return Access_Rights is
+     (Access_Rights'(Dev => Device_Owner, Links => Attached))
+   with Ghost;
+
    function Kernel_Entry_Ok (E : U64) return Boolean is
      (E = 0 or else (E < 2**54 and then Is_Table (E)));
 
@@ -175,7 +198,7 @@ is
      (Pool_Ppn <= Max_Base_Ppn
       and then Frame_Base <= Max_Base_Ppn
       and then Frame_Count <= U64 (Max_Frames)
-      and then not Frame_In (Device_Ppn, Frame_Base, Frame_Count)
+      and then (for all D in Device_Id => not Frame_In (Device_Ppn (D), Frame_Base, Frame_Count))
       and then
         (if Ready
          then Frame_Count >= 1
@@ -193,20 +216,29 @@ is
           then Slot_Of (F) in 1 .. Count_Of (Owner (F))
             and then List (Owner (F)) (Slot_Of (F)) = F))
       and then
-        (for all S in Space_Id =>
+        (for all S in Holder_Id =>
            (for all I in 1 .. Count_Of (S) =>
               Owner (List (S) (I)) = S and then Slot_Of (List (S) (I)) = I)))
    with
      Ghost,
      Annotate => (GNATprove, Hide_Info, "Expression_Function_Body");
 
+   --  Una región sin marcos no existe: nadie está unido a ella. Y ninguna
+   --  pasa de Max_Region_Pages.
+   function Regions_Ok return Boolean is
+     (for all R in Region_Tag =>
+        Count_Of (R) <= Max_Region_Pages
+        and then (if Count_Of (R) = 0 then (for all S in Space_Id => not Attached (R, S))))
+   with Ghost;
+
    function Invariant return Boolean is
      (Bounds_Ok
       and then Lists_Ok
+      and then Regions_Ok
       and then
         (for all S in Space_Id =>
            Structure_Ok (Pool (S), Info (S), Pool_Ppn, S, Kernel)
-           and then Frames_Owned (Pool (S), S, Frame_Base, Frame_Count, Owner, Device_Owner)));
+           and then Frames_Owned (Pool (S), S, Frame_Base, Frame_Count, Owner, Rights)));
 
    function Own_Table (E : U64; S : Space_Id) return Boolean is
      (Is_Table (E)
@@ -231,14 +263,30 @@ is
              (Low_Index (Va)));
 
    function Frame_Owner_Is (Ppn : U64; S : Space_Id) return Boolean is
-     (Owned_Ppn (Ppn, S, Frame_Base, Frame_Count, Owner, Device_Owner));
+     (Owned_Ppn (Ppn, S, Frame_Base, Frame_Count, Owner, Rights));
    pragma Annotate (GNATprove, Hide_Info, "Expression_Function_Body", Frame_Owner_Is);
 
    function No_Frames_Owned (S : Space_Id) return Boolean is
      (for all F in Frame_Number =>
         (if U64 (F) < Frame_Count then Owner (F) /= S));
 
-   function Device_Holder return Owner_Tag is (Device_Owner);
+   function Device_Holders return Device_Map is (Device_Owner);
+
+   function Attached_To (R : Region_Tag; S : Space_Id) return Boolean is (Attached (R, S));
+
+   function Shared_By (Ppn : U64; A, B : Space_Id) return Boolean is
+     (Frame_In (Ppn, Frame_Base, Frame_Count)
+      and then Ppn - Frame_Base < U64 (Max_Frames)
+      and then Owner (Frame_Number (Ppn - Frame_Base)) in Region_Tag
+      and then Attached (Owner (Frame_Number (Ppn - Frame_Base)), A)
+      and then Attached (Owner (Frame_Number (Ppn - Frame_Base)), B));
+
+   function Private_To (Ppn : U64; S : Space_Id) return Boolean is
+     (Frame_In (Ppn, Frame_Base, Frame_Count)
+      and then Ppn - Frame_Base < U64 (Max_Frames)
+      and then Owner (Frame_Number (Ppn - Frame_Base)) = S);
+
+   function Pages_Of (R : Region_Tag) return U64 is (U64 (Count_Of (R)));
 
    ---------------------------------------------------------------------------
    --  Lemas. Cada uno recibe por parámetro solo lo que necesita.
@@ -321,7 +369,7 @@ is
 
    procedure Lemma_Zero_Owns_Nothing
      (T : Space_Tables; S : Space_Id; Base, Count : U64; O : Owner_Map;
-      Dev : Owner_Tag)
+      Dev : Access_Rights)
    with
      Ghost,
      Global => null,
@@ -409,7 +457,7 @@ is
       O     : Owner_Map;
       Leaf  : Leaf_Slot;
       Index : Entry_Index;
-      Dev : Owner_Tag)
+      Dev : Access_Rights)
    with
      Ghost,
      Global => null,
@@ -538,7 +586,7 @@ is
       Base  : U64;
       Count : U64;
       O     : Owner_Map;
-      Dev : Owner_Tag)
+      Dev : Access_Rights)
    with
      Ghost,
      Global => null,
@@ -560,13 +608,13 @@ is
       Count : U64;
       O, O2 : Owner_Map;
       F     : Frame_Number;
-      Dev : Owner_Tag)
+      Dev : Access_Rights)
    with
      Ghost,
      Global => null,
      Pre    =>
        Frames_Owned (T, S, Base, Count, O, Dev)
-       and then O (F) /= S
+       and then not Uses (O (F), S, Dev)
        and then (for all G in Frame_Number => (if G /= F then O2 (G) = O (G))),
      Post   => Frames_Owned (T, S, Base, Count, O2, Dev)
    is
@@ -575,22 +623,23 @@ is
       null;
    end Lemma_Other_Owner;
 
-   --  El mismo paso para todos los espacios salvo S.
+   --  El mismo paso para todos los espacios salvo S (S puede ser una región:
+   --  entonces para todos).
    procedure Lemma_Other_Owners
      (Tables : Space_Pool;
-      S      : Space_Id;
+      S      : Owner_Tag;
       Base   : U64;
       Count  : U64;
       O, O2  : Owner_Map;
       F      : Frame_Number;
-      Dev : Owner_Tag)
+      Dev : Access_Rights)
    with
      Ghost,
      Global => null,
      Pre    =>
        (for all X in Space_Id =>
           (if X /= S then Frames_Owned (Tables (X), X, Base, Count, O, Dev)))
-       and then (O (F) = S or else O (F) = No_Owner)
+       and then (for all X in Space_Id => (if X /= S then not Uses (O (F), X, Dev)))
        and then (for all G in Frame_Number => (if G /= F then O2 (G) = O (G))),
      Post   =>
        (for all X in Space_Id =>
@@ -617,7 +666,7 @@ is
       Leaf  : Leaf_Slot;
       Index : Entry_Index;
       Ppn   : U64;
-      Dev : Owner_Tag)
+      Dev : Access_Rights)
    with
      Ghost,
      Global => null,
@@ -640,12 +689,15 @@ is
       Base    : U64;
       Count   : U64;
       O       : Owner_Map;
-      Dev     : Owner_Tag;
-      Dev2    : Owner_Tag)
+      Dev     : Access_Rights;
+      Dev2    : Access_Rights)
    with
      Ghost,
      Global => null,
-     Pre    => Frames_Owned (T, S, Base, Count, O, Dev) and then Dev /= S,
+     Pre    =>
+       Frames_Owned (T, S, Base, Count, O, Dev)
+       and then (for all E in Device_Id => (if Dev.Dev (E) = S then Dev2.Dev (E) = S))
+       and then Dev2.Links = Dev.Links,
      Post   => Frames_Owned (T, S, Base, Count, O, Dev2)
    is
       pragma Annotate (GNATprove, Unhide_Info, "Expression_Function_Body", Frames_Owned);
@@ -659,15 +711,22 @@ is
       Base   : U64;
       Count  : U64;
       O      : Owner_Map;
-      Dev    : Owner_Tag;
-      Dev2   : Owner_Tag)
+      Dev    : Access_Rights;
+      Dev2   : Access_Rights)
    with
      Ghost,
      Global => null,
      Pre    =>
        (for all X in Space_Id =>
           (if X /= S then Frames_Owned (Tables (X), X, Base, Count, O, Dev)))
-       and then (Dev = S or else Dev = No_Owner),
+       --  Solo cambian dispositivos que eran de S o de nadie, y pasan a S o a nadie.
+       and then
+         (for all E in Device_Id =>
+            Dev2.Dev (E) = Dev.Dev (E)
+            or else
+              ((Dev.Dev (E) = S or else Dev.Dev (E) = No_Owner)
+               and then (Dev2.Dev (E) = S or else Dev2.Dev (E) = No_Owner)))
+       and then Dev2.Links = Dev.Links,
      Post   =>
        (for all X in Space_Id =>
           (if X /= S then Frames_Owned (Tables (X), X, Base, Count, O, Dev2)))
@@ -684,6 +743,66 @@ is
       end loop;
    end Lemma_Device_Others;
 
+   --  Más uniones (o las mismas) para S: S sigue teniendo solo lo que puede usar.
+   procedure Lemma_Links_Grow
+     (T     : Space_Tables;
+      S     : Space_Id;
+      Base  : U64;
+      Count : U64;
+      O     : Owner_Map;
+      Dev   : Access_Rights;
+      Dev2  : Access_Rights)
+   with
+     Ghost,
+     Global => null,
+     Pre    =>
+       Frames_Owned (T, S, Base, Count, O, Dev)
+       and then Dev2.Dev = Dev.Dev
+       and then (for all R in Region_Tag => (if Dev.Links (R, S) then Dev2.Links (R, S))),
+     Post   => Frames_Owned (T, S, Base, Count, O, Dev2)
+   is
+      pragma Annotate (GNATprove, Unhide_Info, "Expression_Function_Body", Frames_Owned);
+   begin
+      null;
+   end Lemma_Links_Grow;
+
+   --  Lo mismo para todos los espacios salvo S (S puede ser una región:
+   --  entonces para todos).
+   procedure Lemma_Links_Others
+     (Tables : Space_Pool;
+      S      : Owner_Tag;
+      Base   : U64;
+      Count  : U64;
+      O      : Owner_Map;
+      Dev    : Access_Rights;
+      Dev2   : Access_Rights)
+   with
+     Ghost,
+     Global => null,
+     Pre    =>
+       (for all X in Space_Id =>
+          (if X /= S then Frames_Owned (Tables (X), X, Base, Count, O, Dev)))
+       and then Dev2.Dev = Dev.Dev
+       and then
+         (for all X in Space_Id =>
+            (if X /= S
+             then (for all R in Region_Tag => (if Dev.Links (R, X) then Dev2.Links (R, X))))),
+     Post   =>
+       (for all X in Space_Id =>
+          (if X /= S then Frames_Owned (Tables (X), X, Base, Count, O, Dev2)))
+   is
+   begin
+      for X in Space_Id loop
+         if X /= S then
+            Lemma_Links_Grow (Tables (X), X, Base, Count, O, Dev, Dev2);
+         end if;
+         pragma Loop_Invariant
+           (for all Y in Space_Id =>
+              (if Y <= X and then Y /= S
+               then Frames_Owned (Tables (Y), Y, Base, Count, O, Dev2)));
+      end loop;
+   end Lemma_Links_Others;
+
    ---------------------------------------------------------------------------
 
    procedure Lemma_Walk_Owned (S : Space_Id; Va : U64) is
@@ -696,7 +815,7 @@ is
       Leaf : Table_Slot;
    begin
       pragma Assert (Structure_Ok (T, I, Pool_Ppn, S, Kernel));
-      pragma Assert (Frames_Owned (T, S, Frame_Base, Frame_Count, Owner, Device_Owner));
+      pragma Assert (Frames_Owned (T, S, Frame_Base, Frame_Count, Owner, Rights));
       pragma Assert (Root_Index (Va) in 4 .. 255);
 
       Lemma_Root_Entry (T, I, Pool_Ppn, S, Kernel, Root_Index (Va));
@@ -712,7 +831,7 @@ is
 
       pragma Assert (T (Leaf) (Low_Index (Va)) = Walk (S, Va));
       Lemma_Leaf_Entry (T, I, Pool_Ppn, S, Kernel, Leaf, Low_Index (Va));
-      Lemma_Owned_Entry (T, S, Frame_Base, Frame_Count, Owner, Leaf, Low_Index (Va), Device_Owner);
+      Lemma_Owned_Entry (T, S, Frame_Base, Frame_Count, Owner, Leaf, Low_Index (Va), Rights);
    end Lemma_Walk_Owned;
 
    procedure Lemma_Isolation (A, B : Space_Id; Va_A, Va_B : U64) is
@@ -721,6 +840,11 @@ is
       Lemma_Walk_Owned (A, Va_A);
       Lemma_Walk_Owned (B, Va_B);
    end Lemma_Isolation;
+
+   procedure Lemma_Private (A, B : Space_Id; Va_A, Va_B : U64) is
+   begin
+      Lemma_Isolation (A, B, Va_A, Va_B);
+   end Lemma_Private;
 
    --  Antes de Init no hay espacios activos: nada depende de los valores que fija.
    procedure Lemma_Rebase
@@ -733,7 +857,7 @@ is
       O        : Owner_Map;
       Old_K    : Kernel_Root;
       New_K    : Kernel_Root;
-      Dev : Owner_Tag)
+      Dev : Access_Rights)
    with
      Ghost,
      Global => null,
@@ -762,7 +886,7 @@ is
    --  El estado inicial cumple la invariante: todo está a cero.
    procedure Lemma_Initial_State with
      Ghost,
-     Global => (Input => (Pool, Info, Owner, Device_Owner, Kernel, Pool_Ppn, Frame_Base, Frame_Count)),
+     Global => (Input => (Pool, Info, Owner, Device_Owner, Attached, Kernel, Pool_Ppn, Frame_Base, Frame_Count)),
      Pre    =>
        (for all X in Space_Id =>
           Is_Zero (Pool (X))
@@ -772,17 +896,17 @@ is
      Post   =>
        (for all X in Space_Id =>
           Structure_Ok (Pool (X), Info (X), Pool_Ppn, X, Kernel)
-          and then Frames_Owned (Pool (X), X, Frame_Base, Frame_Count, Owner, Device_Owner))
+          and then Frames_Owned (Pool (X), X, Frame_Base, Frame_Count, Owner, Rights))
    is
    begin
       for X in Space_Id loop
          Lemma_Zero_Is_Ok (Pool (X), Info (X), Pool_Ppn, X, Kernel);
-         Lemma_Zero_Owns_Nothing (Pool (X), X, Frame_Base, Frame_Count, Owner, Device_Owner);
+         Lemma_Zero_Owns_Nothing (Pool (X), X, Frame_Base, Frame_Count, Owner, Rights);
          pragma Loop_Invariant
            (for all Y in Space_Id =>
               (if Y <= X
                then Structure_Ok (Pool (Y), Info (Y), Pool_Ppn, Y, Kernel)
-                 and then Frames_Owned (Pool (Y), Y, Frame_Base, Frame_Count, Owner, Device_Owner)));
+                 and then Frames_Owned (Pool (Y), Y, Frame_Base, Frame_Count, Owner, Rights)));
       end loop;
    end Lemma_Initial_State;
 
@@ -792,7 +916,7 @@ is
      Global => (Proof_In => (Owner, List, Count_Of, Slot_Of)),
      Pre    =>
        (for all F in Frame_Number => Owner (F) = No_Owner)
-       and then (for all S in Space_Id => Count_Of (S) = 0),
+       and then (for all S in Holder_Id => Count_Of (S) = 0),
      Post   => Lists_Ok
    is
       pragma Annotate (GNATprove, Unhide_Info, "Expression_Function_Body", Lists_Ok);
@@ -816,7 +940,8 @@ is
         or else First_Frame / Page_Bytes > Max_Base_Ppn
         or else Count = 0
         or else Count > U64 (Max_Frames)
-        or else Frame_In (Device_Ppn, First_Frame / Page_Bytes, Count)
+        or else Frame_In (Device_Ppn (0), First_Frame / Page_Bytes, Count)
+        or else Frame_In (Device_Ppn (1), First_Frame / Page_Bytes, Count)
         or else Pool_Address / Page_Bytes + U64 (Max_Spaces) * Tables_Per_Space
                   > First_Frame / Page_Bytes
         or else (for some I in Kernel_Root_Index => not Kernel_Entry_Ok (Entries (I)))
@@ -831,7 +956,7 @@ is
       Ready       := True;
 
       Lemma_Rebase
-        (Pool, Info, Old_Base, Pool_Ppn, Frame_Base, Frame_Count, Owner, Old_K, Kernel, Device_Owner);
+        (Pool, Info, Old_Base, Pool_Ppn, Frame_Base, Frame_Count, Owner, Old_K, Kernel, Rights);
       return Status_Ok;
    end Init;
 
@@ -868,7 +993,7 @@ is
 
          Lemma_Activate (Old_T, Pool (Found), Info (Found), Pool_Ppn, Found, Kernel);
          Lemma_Same_Leaves
-           (Old_T, Pool (Found), Found, Frame_Base, Frame_Count, Owner, Device_Owner);
+           (Old_T, Pool (Found), Found, Frame_Base, Frame_Count, Owner, Rights);
       end;
       return U64 (Found);
    end Create;
@@ -919,7 +1044,7 @@ is
          Info (S).Mid_Used := Info (S).Mid_Used + 1;
 
          Lemma_Add_Mid (Old_T, Pool (S), Old_I, Info (S), Pool_Ppn, S, Kernel, Index);
-         Lemma_Same_Leaves (Old_T, Pool (S), S, Frame_Base, Frame_Count, Owner, Device_Owner);
+         Lemma_Same_Leaves (Old_T, Pool (S), S, Frame_Base, Frame_Count, Owner, Rights);
       else
          Mid := Mid_Slot (Ppn_Of (Current) - Table_Ppn (Pool_Ppn, S, 0));
       end if;
@@ -974,7 +1099,7 @@ is
          Info (S).Leaf_Used := Info (S).Leaf_Used + 1;
 
          Lemma_Add_Leaf (Old_T, Pool (S), Old_I, Info (S), Pool_Ppn, S, Kernel, Mid, Index);
-         Lemma_Same_Leaves (Old_T, Pool (S), S, Frame_Base, Frame_Count, Owner, Device_Owner);
+         Lemma_Same_Leaves (Old_T, Pool (S), S, Frame_Base, Frame_Count, Owner, Rights);
          pragma Assert (Ppn_Of (Pool (S) (Mid) (Index)) = Table_Ppn (Pool_Ppn, S, Leaf));
       else
          Leaf := Leaf_Slot (Ppn_Of (Current) - Table_Ppn (Pool_Ppn, S, 0));
@@ -1022,13 +1147,13 @@ is
       Slot_Of (F) := Count_Of (S);
       Owner (F) := S;
       pragma Assert (Lists_Ok);
-      Lemma_Other_Owners (Pool, S, Frame_Base, Frame_Count, Old_O, Owner, F, Device_Owner);
-      Lemma_Other_Owner (Old_T, S, Frame_Base, Frame_Count, Old_O, Owner, F, Device_Owner);
+      Lemma_Other_Owners (Pool, S, Frame_Base, Frame_Count, Old_O, Owner, F, Rights);
+      Lemma_Other_Owner (Old_T, S, Frame_Base, Frame_Count, Old_O, Owner, F, Rights);
 
       Pool (S) (Leaf) (Index) := User_Leaf (Ppn, Perm);
       Lemma_Install_Structure (Old_T, Pool (S), Info (S), Pool_Ppn, S, Kernel, Leaf, Index);
       Lemma_Install_Owned
-        (Old_T, Pool (S), S, Frame_Base, Frame_Count, Owner, Leaf, Index, Ppn, Device_Owner);
+        (Old_T, Pool (S), S, Frame_Base, Frame_Count, Owner, Leaf, Index, Ppn, Rights);
    end Install_Leaf;
 
    --  Última fase de Map_New: reserva el marco y lo instala en una entrada libre.
@@ -1139,9 +1264,10 @@ is
       return Result;
    end Map_New;
 
-   --  Entrega el dispositivo a S y lo mapea en una entrada libre.
+   --  Entrega el dispositivo D a S y lo mapea en una entrada libre.
    procedure Install_Device
      (S     : Space_Id;
+      D     : Device_Id;
       Leaf  : Leaf_Slot;
       Index : Entry_Index)
    with
@@ -1150,32 +1276,34 @@ is
        and then Ready
        and then Info (S).Active
        and then U64 (Leaf) - 3 < U64 (Info (S).Leaf_Used)
-       and then Device_Owner = No_Owner,
+       and then Device_Owner (D) = No_Owner,
      Post =>
        Invariant
        and then Info = Info'Old
-       and then Device_Owner = S
-       and then Pool (S) (Leaf) (Index) = User_Leaf (Device_Ppn, Read_Write)
+       and then Device_Owner = (Device_Owner'Old with delta D => S)
+       and then Pool (S) (Leaf) (Index) = User_Leaf (Device_Ppn (D), Read_Write)
        and then Pool (S) (0) = Pool'Old (S) (0)
        and then (for all X in Mid_Slot => Pool (S) (X) = Pool'Old (S) (X))
    is
       Old_T   : constant Space_Tables := Pool (S) with Ghost;
-      Old_Dev : constant Owner_Tag := Device_Owner with Ghost;
+      Old_Dev : constant Access_Rights := Rights with Ghost;
    begin
-      Lemma_User_Leaf (Device_Ppn, Read_Write);
+      Lemma_User_Leaf (Device_Ppn (D), Read_Write);
 
-      Device_Owner := S;
+      Device_Owner (D) := S;
       Lemma_Device_Others
-        (Pool, S, Frame_Base, Frame_Count, Owner, Old_Dev, Device_Owner);
-      Lemma_Device_Change (Old_T, S, Frame_Base, Frame_Count, Owner, Old_Dev, Device_Owner);
+        (Pool, S, Frame_Base, Frame_Count, Owner, Old_Dev, Rights);
+      Lemma_Device_Change (Old_T, S, Frame_Base, Frame_Count, Owner, Old_Dev, Rights);
 
-      Pool (S) (Leaf) (Index) := User_Leaf (Device_Ppn, Read_Write);
+      Pool (S) (Leaf) (Index) := User_Leaf (Device_Ppn (D), Read_Write);
       Lemma_Install_Structure (Old_T, Pool (S), Info (S), Pool_Ppn, S, Kernel, Leaf, Index);
+      pragma Assert (Owned_Ppn (Device_Ppn (D), S, Frame_Base, Frame_Count, Owner, Rights));
       Lemma_Install_Owned
-        (Old_T, Pool (S), S, Frame_Base, Frame_Count, Owner, Leaf, Index, Device_Ppn, Device_Owner);
+        (Old_T, Pool (S), S, Frame_Base, Frame_Count, Owner, Leaf, Index, Device_Ppn (D), Rights);
    end Install_Device;
 
-   function Map_Device (Space, Va : U64) return U64 is
+   function Map_Device (Space, Device, Va : U64) return U64 is
+      D      : Device_Id;
       S      : Space_Id;
       Mid    : Mid_Slot;
       Leaf   : Leaf_Slot;
@@ -1183,6 +1311,7 @@ is
    begin
       if not Ready
         or else not Valid_Space (Space)
+        or else not Valid_Device (Device)
         or else not In_User_Window (Va)
         or else Va mod Page_Bytes /= 0
       then
@@ -1190,11 +1319,12 @@ is
       end if;
 
       S := Owner_Tag (Space);
+      D := Device_Id (Device);
       if not Info (S).Active then
          return Status_Invalid;
       end if;
 
-      if Device_Owner /= No_Owner then
+      if Device_Owner (D) /= No_Owner then
          return Status_Conflict;
       end if;
 
@@ -1217,7 +1347,7 @@ is
       pragma Assert (Own_Table (Pool (S) (Mid) (Mid_Index (Va)), S));
       pragma Assert (Child_Slot (Pool (S) (Mid) (Mid_Index (Va)), S) = Leaf);
 
-      Install_Device (S, Leaf, Low_Index (Va));
+      Install_Device (S, D, Leaf, Low_Index (Va));
 
       pragma Assert (Own_Table (Pool (S) (0) (Root_Index (Va)), S));
       pragma Assert (Child_Slot (Pool (S) (0) (Root_Index (Va)), S) = Mid);
@@ -1246,7 +1376,7 @@ is
       Lemma_Walk_Owned (Owner_Tag (Space), Va);
 
       --  Leer un registro de un dispositivo tiene efectos: el kernel nunca lo hace.
-      if Ppn_Of (E) = Device_Ppn then
+      if Is_Device_Ppn (Ppn_Of (E)) then
          return 0;
       end if;
 
@@ -1262,7 +1392,401 @@ is
       return Result;
    end Translate;
 
+   ---------------------------------------------------------------------------
+   --  Regiones compartidas.
+   ---------------------------------------------------------------------------
+
+   --  Un marco recién reservado y sin dueño pasa al final de la lista de R.
+   procedure Add_Region_Frame (R : Region_Tag; F : Frame_Number) with
+     Pre  =>
+       Invariant
+       and then Owner (F) = No_Owner
+       and then Count_Of (R) < Max_Region_Pages
+       and then (for all S in Space_Id => not Attached (R, S)),
+     Post =>
+       Invariant
+       and then Count_Of (R) = Count_Of'Old (R) + 1
+       and then Attached = Attached'Old
+       and then Pool = Pool'Old
+       and then Info = Info'Old
+   is
+      pragma Annotate (GNATprove, Unhide_Info, "Expression_Function_Body", Lists_Ok);
+      Old_O : constant Owner_Map := Owner with Ghost;
+   begin
+      Count_Of (R) := Count_Of (R) + 1;
+      List (R) (Count_Of (R)) := F;
+      Slot_Of (F) := Count_Of (R);
+      Owner (F) := R;
+      pragma Assert (Lists_Ok);
+      Lemma_Other_Owners (Pool, R, Frame_Base, Frame_Count, Old_O, Owner, F, Rights);
+   end Add_Region_Frame;
+
+   --  Devuelve al asignador los marcos de una región a la que nadie está unido.
+   procedure Release_Region (R : Region_Tag; Failed : out Boolean) with
+     Pre  =>
+       Invariant
+       and then (for all S in Space_Id => not Attached (R, S)),
+     Post =>
+       Invariant
+       and then Count_Of (R) = 0
+       and then Attached = Attached'Old
+       and then Pool = Pool'Old
+       and then Info = Info'Old
+   is
+      pragma Annotate (GNATprove, Unhide_Info, "Expression_Function_Body", Lists_Ok);
+      Status : Frame_Gate.U64;
+   begin
+      Failed := False;
+      for I in 1 .. Count_Of (R) loop
+         pragma Loop_Invariant
+           (for all X in Space_Id =>
+              Frames_Owned (Pool (X), X, Frame_Base, Frame_Count, Owner, Rights));
+         pragma Loop_Invariant
+           (for all J in I .. Count_Of (R) =>
+              Owner (List (R) (J)) = R and then Slot_Of (List (R) (J)) = J);
+         pragma Loop_Invariant
+           (for all G in Frame_Number =>
+              (if Owner (G) = R
+               then Slot_Of (G) in I .. Count_Of (R) and then List (R) (Slot_Of (G)) = G));
+         pragma Loop_Invariant
+           (for all G in Frame_Number =>
+              (if Owner (G) /= No_Owner and then Owner (G) /= R
+               then Slot_Of (G) in 1 .. Count_Of (Owner (G))
+                 and then List (Owner (G)) (Slot_Of (G)) = G));
+         pragma Loop_Invariant
+           (for all X in Holder_Id =>
+              (if X /= R
+               then (for all J in 1 .. Count_Of (X) =>
+                       Owner (List (X) (J)) = X and then Slot_Of (List (X) (J)) = J)));
+         pragma Loop_Invariant (Attached = Attached'Loop_Entry);
+         pragma Loop_Invariant (Pool = Pool'Loop_Entry and then Info = Info'Loop_Entry);
+
+         declare
+            F     : constant Frame_Number := List (R) (I);
+            Old_O : constant Owner_Map := Owner with Ghost;
+         begin
+            Owner (F) := No_Owner;
+            Lemma_Other_Owners (Pool, R, Frame_Base, Frame_Count, Old_O, Owner, F, Rights);
+            Status := Frame_Gate.Free
+              (Frame_Gate.U64 ((Frame_Base + U64 (F)) * Page_Bytes));
+            if Status /= Frame_Gate.Status_Ok then
+               Failed := True;
+            end if;
+         end;
+      end loop;
+
+      pragma Assert (for all G in Frame_Number => Owner (G) /= R);
+      Count_Of (R) := 0;
+      pragma Assert (Lists_Ok);
+   end Release_Region;
+
+   function Region_Create (Pages : U64) return U64 is
+      R       : Region_Tag := Region_Tag'First;
+      Found   : Boolean := False;
+      Address : Frame_Gate.U64;
+      Code    : U64;
+      Ppn     : U64;
+      Ignored : Frame_Gate.U64;
+      Failed  : Boolean;
+      pragma Unreferenced (Ignored);
+   begin
+      if not Ready or else Pages = 0 or else Pages > U64 (Max_Region_Pages) then
+         return 0;
+      end if;
+
+      for X in Region_Tag loop
+         if Count_Of (X) = 0 then
+            R := X;
+            Found := True;
+            exit;
+         end if;
+      end loop;
+      if not Found then
+         return 0;
+      end if;
+      pragma Assert (for all S in Space_Id => not Attached (R, S));
+
+      for I in 1 .. Pages loop
+         pragma Loop_Invariant (Invariant);
+         pragma Loop_Invariant (Ready);
+         pragma Loop_Invariant (U64 (Count_Of (R)) = I - 1);
+         pragma Loop_Invariant (for all S in Space_Id => not Attached (R, S));
+
+         Address := Frame_Gate.Alloc;
+         Code := U64 (Address);
+         Ppn := Code / Page_Bytes;
+         if Code = 0
+           or else Code mod Page_Bytes /= 0
+           or else not Frame_In (Ppn, Frame_Base, Frame_Count)
+           or else Owner (Frame_Number (Ppn - Frame_Base)) /= No_Owner
+         then
+            --  Sin marcos (o un resultado que no cuadra): no se queda con nada.
+            if Code /= 0 then
+               Ignored := Frame_Gate.Free (Address);
+            end if;
+            pragma Warnings
+              (GNATprove, Off, "*is set by*but not used after the call",
+               Reason => "si además falla una liberación, Region_Create falla igual");
+            Release_Region (R, Failed);
+            pragma Warnings (GNATprove, On, "*is set by*but not used after the call");
+            return 0;
+         end if;
+
+         Add_Region_Frame (R, Frame_Number (Ppn - Frame_Base));
+      end loop;
+
+      pragma Assert (Pages_Of (R) = Pages);
+      return U64 (R) - U64 (Max_Spaces);
+   end Region_Create;
+
+   function Region_Frame (Region, Page : U64) return U64 is
+      R : Region_Tag;
+   begin
+      if not Valid_Region (Region) then
+         return 0;
+      end if;
+      R := Tag_Of (Region);
+      if Page >= U64 (Count_Of (R)) then
+         return 0;
+      end if;
+
+      declare
+         F : constant Frame_Number := List (R) (Owned_Index (Page + 1));
+      begin
+         pragma Assert (Frame_Base + U64 (F) < Max_Ppn);
+         Lemma_Page_Address (Frame_Base + U64 (F));
+         return (Frame_Base + U64 (F)) * Page_Bytes;
+      end;
+   end Region_Frame;
+
+   function Region_Attach (Space, Region : U64) return U64 is
+      S     : Space_Id;
+      R     : Region_Tag;
+      Old_R : constant Access_Rights := Rights with Ghost;
+   begin
+      if not Ready
+        or else not Valid_Space (Space)
+        or else not Valid_Region (Region)
+      then
+         return Status_Invalid;
+      end if;
+
+      S := Owner_Tag (Space);
+      R := Tag_Of (Region);
+      if not Info (S).Active or else Count_Of (R) = 0 then
+         return Status_Invalid;
+      end if;
+
+      Attached (R, S) := True;
+      Lemma_Links_Others (Pool, R, Frame_Base, Frame_Count, Owner, Old_R, Rights);
+      return Status_Ok;
+   end Region_Attach;
+
+   --  Instala en una entrada libre una página de una región a la que S está unido.
+   procedure Install_Shared
+     (S     : Space_Id;
+      Leaf  : Leaf_Slot;
+      Index : Entry_Index;
+      Ppn   : U64;
+      Perm  : Permission)
+   with
+     Pre  =>
+       Invariant
+       and then Ready
+       and then Info (S).Active
+       and then U64 (Leaf) - 3 < U64 (Info (S).Leaf_Used)
+       and then Ppn < Max_Ppn
+       and then Owned_Ppn (Ppn, S, Frame_Base, Frame_Count, Owner, Rights),
+     Post =>
+       Invariant
+       and then Info = Info'Old
+       and then Attached = Attached'Old
+       and then Count_Of = Count_Of'Old
+       and then Pool (S) (Leaf) (Index) = User_Leaf (Ppn, Perm)
+       and then Pool (S) (0) = Pool'Old (S) (0)
+       and then (for all X in Mid_Slot => Pool (S) (X) = Pool'Old (S) (X))
+   is
+      Old_T : constant Space_Tables := Pool (S) with Ghost;
+   begin
+      Lemma_User_Leaf (Ppn, Perm);
+      Pool (S) (Leaf) (Index) := User_Leaf (Ppn, Perm);
+      Lemma_Install_Structure (Old_T, Pool (S), Info (S), Pool_Ppn, S, Kernel, Leaf, Index);
+      Lemma_Install_Owned
+        (Old_T, Pool (S), S, Frame_Base, Frame_Count, Owner, Leaf, Index, Ppn, Rights);
+   end Install_Shared;
+
+   --  Bits de una hoja de usuario de lectura o de lectura y escritura.
+   procedure Lemma_Leaf_Flags (Ppn : U64; Perm : Permission) with
+     Ghost,
+     Global => null,
+     Pre    => Ppn < Max_Ppn and then Perm /= Read_Execute,
+     Post   =>
+       (User_Leaf (Ppn, Perm) and Flag_X) = 0
+       and then ((User_Leaf (Ppn, Perm) and Flag_W) /= 0) = (Perm = Read_Write)
+   is
+   begin
+      null;
+   end Lemma_Leaf_Flags;
+
+   function Region_Map (Space, Region, Page, Va, Writable : U64) return U64 is
+      pragma Annotate (GNATprove, Unhide_Info, "Expression_Function_Body", Lists_Ok);
+      S      : Space_Id;
+      R      : Region_Tag;
+      Mid    : Mid_Slot;
+      Leaf   : Leaf_Slot;
+      Result : U64;
+      Ppn    : U64;
+      Perm   : Permission;
+   begin
+      if not Ready
+        or else not Valid_Space (Space)
+        or else not Valid_Region (Region)
+        or else not In_User_Window (Va)
+        or else Va mod Page_Bytes /= 0
+      then
+         return Status_Invalid;
+      end if;
+
+      S := Owner_Tag (Space);
+      R := Tag_Of (Region);
+      if not Info (S).Active
+        or else not Attached (R, S)
+        or else Page >= U64 (Count_Of (R))
+      then
+         return Status_Invalid;
+      end if;
+
+      Perm := (if Writable /= 0 then Read_Write else Read_Only);
+
+      Ensure_Mid (S, Root_Index (Va), Mid, Result);
+      if Result /= Status_Ok then
+         return Result;
+      end if;
+
+      Ensure_Leaf (S, Mid, Mid_Index (Va), Leaf, Result);
+      if Result /= Status_Ok then
+         return Result;
+      end if;
+
+      if Pool (S) (Leaf) (Low_Index (Va)) /= 0 then
+         return Status_Conflict;
+      end if;
+
+      declare
+         F : constant Frame_Number := List (R) (Owned_Index (Page + 1));
+      begin
+         pragma Assert (Owner (F) = R);
+         Ppn := Frame_Base + U64 (F);
+         --  Las listas no dicen que el marco esté en el rango: se comprueba.
+         if not Frame_In (Ppn, Frame_Base, Frame_Count) then
+            return Status_Internal;
+         end if;
+         pragma Assert (Ppn < Max_Ppn);
+         pragma Assert (Uses (Owner (Frame_Number (Ppn - Frame_Base)), S, Rights));
+      end;
+
+      pragma Assert (Own_Table (Pool (S) (0) (Root_Index (Va)), S));
+      pragma Assert (Child_Slot (Pool (S) (0) (Root_Index (Va)), S) = Mid);
+      pragma Assert (Own_Table (Pool (S) (Mid) (Mid_Index (Va)), S));
+      pragma Assert (Child_Slot (Pool (S) (Mid) (Mid_Index (Va)), S) = Leaf);
+
+      Install_Shared (S, Leaf, Low_Index (Va), Ppn, Perm);
+      Lemma_User_Leaf (Ppn, Perm);
+      Lemma_Leaf_Flags (Ppn, Perm);
+
+      pragma Assert (Own_Table (Pool (S) (0) (Root_Index (Va)), S));
+      pragma Assert (Child_Slot (Pool (S) (0) (Root_Index (Va)), S) = Mid);
+      pragma Assert (Own_Table (Pool (S) (Mid) (Mid_Index (Va)), S));
+      pragma Assert (Child_Slot (Pool (S) (Mid) (Mid_Index (Va)), S) = Leaf);
+      pragma Assert (Walk (S, Va) = Pool (S) (Leaf) (Low_Index (Va)));
+      pragma Assert (Walk (S, Va) = User_Leaf (Ppn, Perm));
+      return Status_Ok;
+   end Region_Map;
+
+   function Region_Frame_For (Space, Region, Page : U64) return U64 is
+      pragma Annotate (GNATprove, Unhide_Info, "Expression_Function_Body", Lists_Ok);
+      R : Region_Tag;
+   begin
+      if not Valid_Space (Space) or else not Valid_Region (Region) then
+         return 0;
+      end if;
+      R := Tag_Of (Region);
+      if not Attached (R, Owner_Tag (Space)) or else Page >= U64 (Count_Of (R)) then
+         return 0;
+      end if;
+
+      declare
+         F : constant Frame_Number := List (R) (Owned_Index (Page + 1));
+      begin
+         pragma Assert (Owner (F) = R);
+         --  Las listas no dicen que el marco esté en el rango: se comprueba.
+         if U64 (F) >= Frame_Count then
+            return 0;
+         end if;
+         pragma Assert (Frame_Base + U64 (F) < Max_Ppn);
+         Lemma_Page_Address (Frame_Base + U64 (F));
+         pragma Assert ((Frame_Base + U64 (F)) * Page_Bytes / Page_Bytes = Frame_Base + U64 (F));
+         return (Frame_Base + U64 (F)) * Page_Bytes;
+      end;
+   end Region_Frame_For;
+
+   function Region_In_Use (Region : U64) return U64 is
+   begin
+      if not Valid_Region (Region) then
+         return 0;
+      end if;
+      for S in Space_Id loop
+         if Attached (Tag_Of (Region), S) then
+            return 1;
+         end if;
+         pragma Loop_Invariant
+           (for all X in Space_Id'First .. S => not Attached (Tag_Of (Region), X));
+      end loop;
+      return 0;
+   end Region_In_Use;
+
+   function Region_Free (Region : U64) return U64 is
+      R      : Region_Tag;
+      Failed : Boolean;
+   begin
+      if not Ready or else not Valid_Region (Region) then
+         return Status_Invalid;
+      end if;
+      R := Tag_Of (Region);
+      if Count_Of (R) = 0 then
+         return Status_Invalid;
+      end if;
+      for S in Space_Id loop
+         if Attached (R, S) then
+            return Status_Conflict;
+         end if;
+         pragma Loop_Invariant (for all X in Space_Id'First .. S => not Attached (R, X));
+      end loop;
+
+      Release_Region (R, Failed);
+      return (if Failed then Status_Internal else Status_Ok);
+   end Region_Free;
+
    --  En un espacio activo, las tablas que no están en uso están a cero.
+   --  S deja el dispositivo D: los demás espacios siguen con lo que tenían.
+   procedure Release_Device (S : Space_Id; D : Device_Id) with
+     Pre  =>
+       Device_Owner (D) = S
+       and then
+         (for all X in Space_Id =>
+            (if X /= S then Frames_Owned (Pool (X), X, Frame_Base, Frame_Count, Owner, Rights))),
+     Post =>
+       Device_Owner = (Device_Owner'Old with delta D => No_Owner)
+       and then
+         (for all X in Space_Id =>
+            (if X /= S then Frames_Owned (Pool (X), X, Frame_Base, Frame_Count, Owner, Rights)))
+   is
+      Old_Dev : constant Access_Rights := Rights with Ghost;
+   begin
+      Device_Owner (D) := No_Owner;
+      Lemma_Device_Others (Pool, S, Frame_Base, Frame_Count, Owner, Old_Dev, Rights);
+   end Release_Device;
+
    procedure Lemma_Unused_Zero
      (T    : Space_Tables;
       I    : Space_Info;
@@ -1304,7 +1828,7 @@ is
          pragma Loop_Invariant
            (for all X in Space_Id =>
               (if X /= S
-               then Frames_Owned (Pool (X), X, Frame_Base, Frame_Count, Owner, Device_Owner)));
+               then Frames_Owned (Pool (X), X, Frame_Base, Frame_Count, Owner, Rights)));
          pragma Loop_Invariant
            (for all J in I .. Count_Of (S) =>
               Owner (List (S) (J)) = S and then Slot_Of (List (S) (J)) = J);
@@ -1318,7 +1842,7 @@ is
                then Slot_Of (G) in 1 .. Count_Of (Owner (G))
                  and then List (Owner (G)) (Slot_Of (G)) = G));
          pragma Loop_Invariant
-           (for all X in Space_Id =>
+           (for all X in Holder_Id =>
               (if X /= S
                then (for all J in 1 .. Count_Of (X) =>
                        Owner (List (X) (J)) = X and then Slot_Of (List (X) (J)) = J)));
@@ -1328,7 +1852,7 @@ is
             Old_O : constant Owner_Map := Owner with Ghost;
          begin
             Owner (F) := No_Owner;
-            Lemma_Other_Owners (Pool, S, Frame_Base, Frame_Count, Old_O, Owner, F, Device_Owner);
+            Lemma_Other_Owners (Pool, S, Frame_Base, Frame_Count, Old_O, Owner, F, Rights);
             Status := Frame_Gate.Free
               (Frame_Gate.U64 ((Frame_Base + U64 (F)) * Page_Bytes));
             if Status /= Frame_Gate.Status_Ok then
@@ -1369,18 +1893,38 @@ is
       end;
       Info (S) := Empty_Info;
 
-      if Device_Owner = S then
-         declare
-            Old_Dev : constant Owner_Tag := Device_Owner with Ghost;
-         begin
-            Device_Owner := No_Owner;
-            Lemma_Device_Others
-              (Pool, S, Frame_Base, Frame_Count, Owner, Old_Dev, Device_Owner);
-         end;
-      end if;
+      for D in Device_Id loop
+         if Device_Owner (D) = S then
+            Release_Device (S, D);
+         end if;
+         pragma Loop_Invariant (for all E in Device_Id'First .. D => Device_Owner (E) /= S);
+         pragma Loop_Invariant
+           (for all X in Space_Id =>
+              (if X /= S then Frames_Owned (Pool (X), X, Frame_Base, Frame_Count, Owner, Rights)));
+         pragma Loop_Invariant (Is_Zero (Pool (S)));
+         pragma Loop_Invariant (Bounds_Ok and then Lists_Ok and then Regions_Ok);
+      end loop;
+
+      --  Deja de estar unido a toda región: sus tablas ya están a cero.
+      declare
+         Old_R : constant Access_Rights := Rights with Ghost;
+      begin
+         for R in Region_Tag loop
+            Attached (R, S) := False;
+            pragma Loop_Invariant (for all Q in Region_Tag'First .. R => not Attached (Q, S));
+            pragma Loop_Invariant
+              (for all Q in Region_Tag =>
+                 (for all X in Space_Id =>
+                    (if X /= S then Attached (Q, X) = Old_R.Links (Q, X))));
+            pragma Loop_Invariant
+              (for all Q in Region_Tag =>
+                 (if Old_R.Links (Q, S) = False then Attached (Q, S) = False));
+         end loop;
+         Lemma_Links_Others (Pool, S, Frame_Base, Frame_Count, Owner, Old_R, Rights);
+      end;
 
       Lemma_Zero_Is_Ok (Pool (S), Info (S), Pool_Ppn, S, Kernel);
-      Lemma_Zero_Owns_Nothing (Pool (S), S, Frame_Base, Frame_Count, Owner, Device_Owner);
+      Lemma_Zero_Owns_Nothing (Pool (S), S, Frame_Base, Frame_Count, Owner, Rights);
 
       return (if Failed then Status_Internal else Status_Ok);
    end Destroy;

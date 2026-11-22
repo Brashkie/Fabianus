@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Clasificación de traps en modo supervisor.
 
 const abi_module = @import("abi.zig");
@@ -66,11 +67,25 @@ pub fn init() void {
 }
 
 /// La cima útil de una pila de traps: los 16 bytes de arriba guardan, en los
-/// 8 superiores, el hart al que pertenece el hilo.
+/// 8 superiores, el hart al que pertenece el hilo y, en los 8 de debajo, si
+/// se le ha pedido morir (`killWord`), que empieza a 0.
 pub fn stackTop(top: u64, owner: u64) u64 {
     const word: *u64 = @ptrFromInt(top - 8);
     word.* = owner;
+    killWord(top).* = 0;
     return top - 16;
+}
+
+/// La palabra de la orden de morir de un hilo, dada la cima de su pila de
+/// traps. Un trap desde usuario deja su marco justo debajo: está en
+/// marco + FB_TF_SIZE, a una sola carga del marco.
+pub inline fn killWord(top: u64) *u64 {
+    return @ptrFromInt(top - 16);
+}
+
+/// La de quien hizo un trap desde usuario, a partir de su marco.
+pub inline fn killWordOfFrame(frame: *const abi.fb_trap_frame) *const u64 {
+    return @ptrFromInt(@intFromPtr(frame) + abi.FB_TF_SIZE);
 }
 
 /// Anuncia que la siguiente excepción de esa causa es parte de una prueba:

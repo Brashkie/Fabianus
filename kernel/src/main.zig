@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Punto de entrada de Fabianus en Zig. Se ejecuta en modo supervisor.
 
 const abi_module = @import("abi.zig");
@@ -20,6 +21,8 @@ const smp = @import("smp.zig");
 const riscv = @import("riscv.zig");
 const selftest_driver = @import("selftest_driver.zig");
 const selftest_user = @import("selftest_user.zig");
+const selftest_shared = @import("selftest_shared.zig");
+const selftest_disk = @import("selftest_disk.zig");
 const thread = @import("thread.zig");
 const trap = @import("trap.zig");
 const uart = @import("uart.zig");
@@ -89,6 +92,8 @@ export fn fb_kmain(hart_id: u64, boot_flags: u64) callconv(.c) noreturn {
     selftest_sleep.run();
     selftest_call.run();
     selftest_driver.run();
+    selftest_shared.run(harts);
+    selftest_disk.run(harts);
     crashIfRequested();
 
     uart.print("boot: ok\n");

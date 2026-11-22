@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 package body Page_Tree with
   SPARK_Mode
 is

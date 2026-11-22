@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Los cerrojos del kernel: uno global y uno por hart.
 //!
 //! El global protege todo lo que comparten los harts: IPC, procesos, memoria,

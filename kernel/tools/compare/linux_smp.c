@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /*
  * Mide en Linux, con varios harts, lo mismo que benchmark.runSmp en Fabianus.
  * Es el /init de un initramfs: mide, imprime y apaga la máquina.
@@ -17,6 +18,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
@@ -328,6 +330,243 @@ static void measure_inversion(void) {
     fflush(stdout);
 }
 
+/*
+ * Pasar 4 KiB de un proceso a otro de otra CPU y una suma de vuelta, como
+ * benchmark.measureSharedPass en Fabianus. Por memoria compartida y futex
+ * (sin copias), y por tubería (el kernel copia los 4 KiB).
+ */
+#define PASS_WORDS 512
+
+struct pass {
+    uint32_t turn;
+    uint32_t pad;
+    uint64_t sum;
+    volatile uint64_t data[PASS_WORDS];
+};
+
+static uint64_t expected_sum(uint64_t round) { return 512 * round + 130816; }
+
+static void shm_pass_once(uint64_t *total) {
+    struct pass *x = shared(8192);
+    pid_t server = fork();
+    if (server == 0) {
+        pin(1);
+        for (int i = 0; i < ROUNDS; i++) {
+            while (__atomic_load_n(&x->turn, __ATOMIC_ACQUIRE) != 1) futex(&x->turn, FUTEX_WAIT, 0);
+            uint64_t sum = 0;
+            for (int j = 0; j < PASS_WORDS; j++) sum += x->data[j];
+            x->sum = sum;
+            __atomic_store_n(&x->turn, 0, __ATOMIC_RELEASE);
+            futex(&x->turn, FUTEX_WAKE, 1);
+        }
+        _exit(0);
+    }
+    pin(0);
+    usleep(10000);
+    int bad = 0;
+    uint64_t begin = rdtime();
+    for (uint64_t round = 1; round <= ROUNDS; round++) {
+        for (int j = 0; j < PASS_WORDS; j++) x->data[j] = round + j;
+        __atomic_store_n(&x->turn, 1, __ATOMIC_RELEASE);
+        futex(&x->turn, FUTEX_WAKE, 1);
+        while (__atomic_load_n(&x->turn, __ATOMIC_ACQUIRE) != 0) futex(&x->turn, FUTEX_WAIT, 1);
+        if (x->sum != expected_sum(round)) bad = 1;
+    }
+    *total = rdtime() - begin;
+    waitpid(server, NULL, 0);
+    if (bad) {
+        printf("la suma por memoria compartida no cuadro\n");
+        fflush(stdout);
+    }
+    munmap(x, 8192);
+}
+
+static int full_read(int fd, void *buffer, size_t size) {
+    size_t done = 0;
+    while (done < size) {
+        ssize_t n = read(fd, (char *)buffer + done, size - done);
+        if (n <= 0) return 0;
+        done += (size_t)n;
+    }
+    return 1;
+}
+
+static void pipe_pass_once(uint64_t *total) {
+    int request[2], answer[2];
+    if (pipe(request) || pipe(answer)) return;
+    pid_t server = fork();
+    if (server == 0) {
+        pin(1);
+        uint64_t data[PASS_WORDS];
+        for (int i = 0; i < ROUNDS; i++) {
+            if (!full_read(request[0], data, sizeof data)) _exit(1);
+            uint64_t sum = 0;
+            for (int j = 0; j < PASS_WORDS; j++) sum += data[j];
+            if (write(answer[1], &sum, sizeof sum) != sizeof sum) _exit(1);
+        }
+        _exit(0);
+    }
+    pin(0);
+    usleep(10000);
+    uint64_t data[PASS_WORDS];
+    int bad = 0;
+    uint64_t begin = rdtime();
+    for (uint64_t round = 1; round <= ROUNDS; round++) {
+        for (int j = 0; j < PASS_WORDS; j++) data[j] = round + j;
+        if (write(request[1], data, sizeof data) != sizeof data) break;
+        uint64_t sum;
+        if (!full_read(answer[0], &sum, sizeof sum)) break;
+        if (sum != expected_sum(round)) bad = 1;
+    }
+    *total = rdtime() - begin;
+    waitpid(server, NULL, 0);
+    if (bad) {
+        printf("la suma por tuberia no cuadro\n");
+        fflush(stdout);
+    }
+    close(request[0]);
+    close(request[1]);
+    close(answer[0]);
+    close(answer[1]);
+}
+
+static void measure_pass(void) {
+    uint64_t total[REPEATS];
+    for (int i = 0; i < REPEATS; i++) shm_pass_once(&total[i]);
+    pin(0);
+    printf("4 KiB entre CPU por memoria compartida y futex (escribir, despertar, leer y sumar): ");
+    print_spread(total, ROUNDS);
+    printf(" por cada 4 KiB (%d x %d)\n", REPEATS, ROUNDS);
+    fflush(stdout);
+    for (int i = 0; i < REPEATS; i++) pipe_pass_once(&total[i]);
+    pin(0);
+    printf("4 KiB entre CPU por tuberia (el kernel copia): ");
+    print_spread(total, ROUNDS);
+    printf(" por cada 4 KiB (%d x %d)\n", REPEATS, ROUNDS);
+    fflush(stdout);
+}
+
+/* Mapear 64 KiB compartidos y escribir en sus 16 páginas, como
+   benchmark.measureRegionMap. */
+static void measure_map(void) {
+    uint64_t total[REPEATS];
+    for (int i = 0; i < REPEATS; i++) {
+        uint64_t begin = rdtime();
+        volatile char *memory = mmap(NULL, 16 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (memory == MAP_FAILED) return;
+        for (int page = 0; page < 16; page++) memory[page * 4096] = (char)page;
+        total[i] = rdtime() - begin;
+        munmap((void *)memory, 16 * 4096);
+    }
+    printf("mapear 64 KiB compartidos y escribir en sus 16 paginas: ");
+    print_spread(total, 1);
+    printf(" (%d veces)\n", REPEATS);
+    fflush(stdout);
+}
+
+/*
+ * Disco virtio-blk (Hito 34), como benchmark.measureDisk en Fabianus: leer y
+ * escribir 4 KiB con O_DIRECT en los sectores 8i mod 2040, contando las
+ * instrucciones de toda la máquina (instret, global con -icount). No con el
+ * reloj: mientras todos esperan al disco, QEMU lo hace saltar.
+ */
+#define DISK_ROUNDS 256
+
+static inline uint64_t rdinstret(void) {
+    uint64_t value;
+    __asm__ volatile("rdinstret %0" : "=r"(value));
+    return value;
+}
+
+static int load_module(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    long status = syscall(SYS_finit_module, fd, "", 0);
+    close(fd);
+    return (int)status;
+}
+
+/* Carga los módulos y monta /dev. Devuelve si hay /dev/vda. */
+static int prepare_disk(void) {
+    if (load_module("/virtio_mmio.ko") != 0 || load_module("/virtio_blk.ko") != 0) {
+        printf("disco: no se pudieron cargar los modulos\n");
+        fflush(stdout);
+        return 0;
+    }
+    mount("devtmpfs", "/dev", "devtmpfs", 0, NULL);
+    /* Linux solo deja leer instret desde usuario con perf_user_access = 2. */
+    int fd = open("/proc/sys/kernel/perf_user_access", O_WRONLY);
+    if (fd >= 0) {
+        if (write(fd, "2", 1) != 1) printf("disco: no se pudo abrir instret\n");
+        close(fd);
+    }
+    return 1;
+}
+
+static void disk_once(int write_mode, uint64_t *instructions) {
+    int fd = open("/dev/vda", (write_mode ? O_RDWR : O_RDONLY) | O_DIRECT);
+    void *buffer = NULL;
+    if (fd < 0 || posix_memalign(&buffer, 4096, 4096) != 0) {
+        printf("disco: no se pudo abrir /dev/vda\n");
+        fflush(stdout);
+        *instructions = 0;
+        return;
+    }
+    memset(buffer, 0x5a, 4096);
+    int bad = 0;
+    uint64_t sector = 0;
+    uint64_t begin = rdinstret();
+    for (int i = 0; i < DISK_ROUNDS; i++) {
+        ssize_t n = write_mode ? pwrite(fd, buffer, 4096, (off_t)(sector * 512))
+                               : pread(fd, buffer, 4096, (off_t)(sector * 512));
+        if (n != 4096) bad = 1;
+        sector += 8;
+        if (sector >= 2040) sector = 0;
+    }
+    *instructions = rdinstret() - begin;
+    if (bad) {
+        printf("disco: una transferencia fallo\n");
+        fflush(stdout);
+    }
+    if (!write_mode && ((uint64_t *)buffer)[1] == 0) {
+        printf("disco: los datos leidos no cuadran\n");
+        fflush(stdout);
+    }
+    free(buffer);
+    close(fd);
+}
+
+static void measure_disk(void) {
+    /* instret desde usuario puede no estar permitido (falla) o no avanzar
+       (Linux 6.12 en este QEMU devuelve siempre lo mismo): se prueba en un
+       hijo con un bucle conocido. */
+    pid_t probe = fork();
+    if (probe == 0) {
+        uint64_t before = rdinstret();
+        __asm__ volatile("li t0, 1000\n1: addi t0, t0, -1\nbnez t0, 1b" ::: "t0");
+        _exit(rdinstret() - before >= 2000 ? 0 : 1);
+    }
+    int status = 0;
+    waitpid(probe, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        printf("disco: /dev/vda funciona, pero instret no avanza leido desde usuario: sin medida\n");
+        fflush(stdout);
+        return;
+    }
+    const char *names[2] = {"leer 4 KiB del disco (O_DIRECT)", "escribir 4 KiB en el disco (O_DIRECT)"};
+    for (int mode = 0; mode < 2; mode++) {
+        uint64_t runs[REPEATS];
+        pin(0);
+        for (int i = 0; i < REPEATS; i++) disk_once(mode, &runs[i]);
+        sort(runs);
+        printf("%s: %llu instrucciones de toda la maquina (minima; mediana %llu, maxima %llu) (%d x %d)\n",
+               names[mode], (unsigned long long)(runs[0] / DISK_ROUNDS),
+               (unsigned long long)(runs[REPEATS / 2] / DISK_ROUNDS),
+               (unsigned long long)(runs[REPEATS - 1] / DISK_ROUNDS), REPEATS, DISK_ROUNDS);
+        fflush(stdout);
+    }
+}
+
 int main(void) {
     mkdir("/proc", 0555);
     mount("proc", "/proc", "proc", 0, NULL);
@@ -340,6 +579,7 @@ int main(void) {
     }
     printf("linux %s: benchmark con %ld CPU\n", release, sysconf(_SC_NPROCESSORS_ONLN));
     fflush(stdout);
+    int disk = prepare_disk();
 
     /* Deja que terminen las tareas de arranque del kernel antes de medir. */
     sleep(3);
@@ -352,6 +592,9 @@ int main(void) {
     measure_ping_pong("pipe, misma CPU", pipe_once, 0, 0);
     measure_ping_pong("pipe, entre CPU", pipe_once, 0, 1);
     measure_inversion();
+    measure_pass();
+    measure_map();
+    if (disk) measure_disk();
 
     printf("fin del benchmark de linux\n");
     fflush(stdout);

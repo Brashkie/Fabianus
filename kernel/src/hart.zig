@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Identidad del hart en el que se ejecuta el kernel.
 //!
 //! El kernel guarda el número de hart en tp. boot.S lo pone al arrancar, y en

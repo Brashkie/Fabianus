@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Autopruebas de la cesión de dispositivos y del driver de UART en Rust.
 //!
 //! Mientras un driver tiene la UART, el kernel no imprime: los resultados se
@@ -112,21 +113,22 @@ fn testDeviceGate() void {
     const second = abi.fb_uspace_create();
     if (first == 0 or second == 0) @panic("no se pudieron crear espacios de prueba");
 
-    expectEqual(abi.fb_uspace_map_device(0, device_base), invalid);
-    expectEqual(abi.fb_uspace_map_device(5, device_base), invalid);
-    expectEqual(abi.fb_uspace_map_device(first, 0x1000), invalid);
-    expectEqual(abi.fb_uspace_map_device(first, device_base + 1), invalid);
+    expectEqual(abi.fb_uspace_map_device(0, abi.FB_DEVICE_UART, device_base), invalid);
+    expectEqual(abi.fb_uspace_map_device(5, abi.FB_DEVICE_UART, device_base), invalid);
+    expectEqual(abi.fb_uspace_map_device(first, abi.FB_DEVICE_UART, 0x1000), invalid);
+    expectEqual(abi.fb_uspace_map_device(first, abi.FB_DEVICE_UART, device_base + 1), invalid);
 
-    expectEqual(abi.fb_uspace_map_device(first, device_base), ok);
-    expectEqual(abi.fb_uspace_map_device(second, device_base), conflict);
-    expectEqual(abi.fb_uspace_map_device(first, device_base + 4096), conflict);
+    expectEqual(abi.fb_uspace_map_device(first, abi.FB_DEVICE_COUNT, device_base), invalid);
+    expectEqual(abi.fb_uspace_map_device(first, abi.FB_DEVICE_UART, device_base), ok);
+    expectEqual(abi.fb_uspace_map_device(second, abi.FB_DEVICE_UART, device_base), conflict);
+    expectEqual(abi.fb_uspace_map_device(first, abi.FB_DEVICE_UART, device_base + 4096), conflict);
 
     // El kernel nunca debe tocar los registros en nombre de un proceso.
     expectEqual(abi.fb_uspace_translate(first, device_base, abi.FB_ACCESS_READ), 0);
     expectEqual(abi.fb_uspace_translate(first, device_base, abi.FB_ACCESS_WRITE), 0);
 
     expectEqual(abi.fb_uspace_destroy(first), ok);
-    expectEqual(abi.fb_uspace_map_device(second, device_base), ok);
+    expectEqual(abi.fb_uspace_map_device(second, abi.FB_DEVICE_UART, device_base), ok);
     expectEqual(abi.fb_uspace_destroy(second), ok);
 }
 

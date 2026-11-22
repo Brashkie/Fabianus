@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 with Scheduler_Core; use Scheduler_Core;
 
 package body Sched_Gate with
@@ -234,6 +235,31 @@ is
               then Status_Ok
               else Notify_Base + U64 (H));
    end Wake_Remote;
+
+   function Wake_Boost (Thread, Level : U64) return U64 is
+      T : Thread_Id;
+      H : Hart_Id;
+   begin
+      if not Started
+        or else Thread = 0
+        or else Thread > Last_Id
+        or else (Level /= None and then Level >= U64 (Levels))
+      then
+         return Status_Invalid;
+      end if;
+
+      T := Thread_Id (Thread);
+      H := Home (T);
+      if Models (H).States (T) /= Blocked or else not Quiet (Models (H), T) then
+         return Status_Wrong_State;
+      end if;
+
+      Set_Floor (Models (H), T, (if Level = None then 0 else Priority (Level)));
+      Wake (Models (H), T);
+      return (if Top_Now (Models (H), Models (H).Running) and then Models (H).Running /= 0
+              then Status_Ok
+              else Notify_Base + U64 (H));
+   end Wake_Boost;
 
    function Promote (Hart, Thread : U64) return U64 is
    begin

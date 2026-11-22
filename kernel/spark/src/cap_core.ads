@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 --  Capabilities: la única forma de que un proceso actúe sobre un objeto.
 --
 --  Teorema (Covered): tras cualquier operación que un proceso pueda pedir, cada
@@ -29,7 +30,9 @@ is
 
    --  Sched: autoriza a fijar prioridad y presupuesto propios; el objeto es la
    --  prioridad máxima que se puede pedir.
-   type Cap_Kind is (None, Endpoint, Console, Device, Sched);
+   --  Region: una región de memoria compartida (objeto = región - 1). Recv
+   --  autoriza a mapearla para leer; Send, además, para escribir.
+   type Cap_Kind is (None, Endpoint, Console, Device, Sched, Region);
 
    type Cap is record
       Kind   : Cap_Kind;
@@ -60,13 +63,14 @@ is
      (Slot < U64 (Max_Slots));
 
    function Valid_Kind (Kind : U64) return Boolean is
-     (Kind >= 1 and then Kind <= 4);
+     (Kind >= 1 and then Kind <= 5);
 
    function Decode_Kind (Kind : U64) return Cap_Kind is
      (if Kind = 1 then Endpoint
       elsif Kind = 2 then Console
       elsif Kind = 3 then Device
-      else Sched)
+      elsif Kind = 4 then Sched
+      else Region)
    with Pre => Valid_Kind (Kind);
 
    function Has_Right (C : Cap; Right : U64) return Boolean is
@@ -168,6 +172,22 @@ is
      Export,
      Convention    => C,
      External_Name => "fb_cap_other_receiver";
+
+   --  1 si alguna capability de algún proceso es de ese tipo y nombra ese
+   --  objeto, 0 si no. Para saber si un objeto ya no lo alcanza nadie.
+   function Refers (Kind, Object : U64) return U64 with
+     Global        => (Input => State),
+     Post          =>
+       (if Valid_Kind (Kind) and then Object < U64 (Max_Objects)
+        then (Refers'Result = 1)
+             = (for some P in Proc_Id =>
+                  (for some S in Slot_Id =>
+                     Snapshot (P) (S).Kind = Decode_Kind (Kind)
+                     and then U64 (Snapshot (P) (S).Object) = Object))
+        else Refers'Result = 0),
+     Export,
+     Convention    => C,
+     External_Name => "fb_cap_refers";
 
    --  Indica si hay una capability en ese hueco.
    function Held (Proc, Slot : U64) return U64 with

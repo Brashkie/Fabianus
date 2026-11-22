@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 --  Núcleo demostrado del asignador de marcos físicos.
 --
 --  No tiene estado global: cada operación recibe el mapa y su contrato describe

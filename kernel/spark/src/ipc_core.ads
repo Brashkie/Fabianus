@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 --  Colas de espera de los endpoints de IPC síncrono.
 --
 --  Invariante inductiva: cada cola no tiene duplicados y cada hilo en cola sabe
@@ -333,6 +334,7 @@ is
 
    --  Servidor del que espera respuesta el hilo, o 0.
    function Waits_For (Thread : U64) return U64 with
+     Inline,
      Global        => (Input => State),
      Pre           => Invariant,
      Post          =>

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Imagen plana del driver. El kernel la copia al inicio de la ventana de usuario
  * con permisos de lectura y ejecución, y le da una pila aparte.

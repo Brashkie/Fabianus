@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 package body Cap_Core with
   SPARK_Mode,
   Refined_State => (State => Store)
@@ -118,6 +119,32 @@ is
          Grant  => (Rights and Right_Grant) /= 0);
       return Status_Ok;
    end Grant;
+
+   function Refers (Kind, Object : U64) return U64 is
+   begin
+      if not Valid_Kind (Kind) or else Object >= U64 (Max_Objects) then
+         return 0;
+      end if;
+      for P in Proc_Id loop
+         for S in Slot_Id loop
+            if Store (P) (S).Kind = Decode_Kind (Kind)
+              and then U64 (Store (P) (S).Object) = Object
+            then
+               return 1;
+            end if;
+            pragma Loop_Invariant
+              (for all T in Slot_Id'First .. S =>
+                 not (Store (P) (T).Kind = Decode_Kind (Kind)
+                      and then U64 (Store (P) (T).Object) = Object));
+         end loop;
+         pragma Loop_Invariant
+           (for all Q in Proc_Id'First .. P =>
+              (for all T in Slot_Id =>
+                 not (Store (Q) (T).Kind = Decode_Kind (Kind)
+                      and then U64 (Store (Q) (T).Object) = Object)));
+      end loop;
+      return 0;
+   end Refers;
 
    function Check (Proc, Slot, Kind, Right : U64) return U64 is
    begin

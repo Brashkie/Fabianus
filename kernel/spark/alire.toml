@@ -1,6 +1,7 @@
 name = "fabianus_core"
 description = "Nucleo verificado de Fabianus en SPARK"
 version = "0.1.0"
+licenses = "GPL-3.0-or-later"
 authors = ["Fabianus"]
 maintainers = ["Fabianus <noreply@example.invalid>"]
 maintainers-logins = ["fabianus"]

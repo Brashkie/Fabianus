@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 --  Núcleo demostrado de las tablas de páginas Sv39 del kernel.
 --
 --  Invariante demostrada (Well_Formed), que vale tras cada operación:

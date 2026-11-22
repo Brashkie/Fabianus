@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 const std = @import("std");
 
 const Crash = enum { none, panic, trap, stack, thread_stack };
@@ -90,6 +91,31 @@ pub fn build(b: *std.Build) void {
     });
     kernel_module.addIncludePath(uart_driver_image.getOutput().dirname());
 
+    // El driver del disco, igual: Rust sin más que `core`, como datos para user.S.
+    const disk_driver = b.addSystemCommand(&rust_flags);
+    disk_driver.addArgs(&.{ "--crate-type=bin", "--crate-name=disk_driver" });
+    disk_driver.addFileArg(b.path("drivers/disk/main.rs"));
+    disk_driver.addPrefixedFileArg("--extern=fb_abi=", rust_abi_library);
+    disk_driver.addPrefixedFileArg("-Clink-arg=-T", b.path("drivers/uart/driver.ld"));
+    disk_driver.addArg("-o");
+    const disk_driver_elf = disk_driver.addOutputFileArg("disk_driver.elf");
+    b.getInstallStep().dependOn(&b.addInstallBinFile(disk_driver_elf, "disk_driver.elf").step);
+    const disk_driver_image = b.addObjCopy(disk_driver_elf, .{
+        .basename = "disk_driver.bin",
+        .format = .bin,
+    });
+    kernel_module.addIncludePath(disk_driver_image.getOutput().dirname());
+
+    // La imagen del disco de pruebas, con un patrón conocido (tools/mkdisk.zig).
+    const mkdisk = b.addExecutable(.{ .name = "mkdisk", .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/mkdisk.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    const mkdisk_run = b.addRunArtifact(mkdisk);
+    const disk_image = mkdisk_run.addOutputFileArg("disk.img");
+    b.getInstallStep().dependOn(&b.addInstallFile(disk_image, "disk.img").step);
+
     const kernel = b.addExecutable(.{
         .name = "fabianus.elf",
         .root_module = kernel_module,
@@ -136,6 +162,11 @@ pub fn build(b: *std.Build) void {
         "-kernel",
     });
     run_qemu.addArtifactArg(kernel);
+    // El disco virtio en la primera ranura, en modo moderno. Con snapshot=on
+    // lo escrito se pierde al apagar: cada arranque ve el mismo disco.
+    run_qemu.addArgs(&.{ "-global", "virtio-mmio.force-legacy=false", "-drive" });
+    run_qemu.addPrefixedFileArg("if=none,format=raw,id=disk0,snapshot=on,file=", disk_image);
+    run_qemu.addArgs(&.{ "-device", "virtio-blk-device,drive=disk0,bus=virtio-mmio-bus.0" });
     // Con icount, instret cuenta instrucciones de forma determinista.
     if (bench) run_qemu.addArgs(&.{ "-icount", "shift=0,sleep=off" });
 

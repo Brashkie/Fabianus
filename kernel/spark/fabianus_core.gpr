@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 project Fabianus_Core is
 
    for Target use "riscv64-elf";

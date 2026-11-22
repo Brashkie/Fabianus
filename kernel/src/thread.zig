@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Hilos del kernel: creación, cambio de contexto y expropiación.
 //! Qué hilo se ejecuta lo decide el planificador demostrado en SPARK, con un
 //! modelo por hart: cada hilo pertenece a un hart y solo corre en él. El hilo
@@ -641,6 +642,66 @@ pub fn refreshFloor(server: u64) void {
     notifyHarts(notifyMask(status));
 }
 
+inline fn hartBit(h: hart.Index) u64 {
+    return @as(u64, 1) << @intCast(h);
+}
+
+/// Veces que una operación fusionada pidió más cerrojos de los dos harts.
+var unheld_count: u64 = 0;
+
+pub fn unheldRetries() u64 {
+    return load(&unheld_count);
+}
+
+/// Llamar y heredar (SPARK: Inherit_Gate.Call_Wake). `server`, de otro hart y
+/// bloqueado esperando peticiones, acaba de recibir una llamada: en una sola
+/// pasada hereda el mayor nivel de sus clientes y despierta. Basta con los
+/// cerrojos de este hart y del suyo; si tiene clientes en otros harts
+/// (aplazados), SPARK lo dice sin tocar nada y se repite con todos.
+/// Con el cerrojo global.
+pub fn wakeInheriting(server: u64) void {
+    const saved = riscv.interruptsOffSaving();
+    _ = rightShared(me());
+    var held = hartBit(me()) | hartBit(homeOf(server));
+    var status: u64 = undefined;
+    while (true) {
+        kernel_lock.enterHarts(held);
+        status = abi.fb_inherit_call_wake(server, held);
+        kernel_lock.leaveHarts();
+        if (status != abi.FB_INHERIT_UNHELD or held == kernel_lock.all_harts) break;
+        count(&unheld_count);
+        held = kernel_lock.all_harts;
+    }
+    riscv.restoreInterruptState(saved);
+    if (status == abi.FB_INHERIT_UNHELD) @panic("faltan cerrojos para despertar al servidor");
+    notifyHarts(notifyMask(status));
+}
+
+/// Responder y heredar (SPARK: Inherit_Gate.Reply_Wake). `server` acaba de
+/// contestar a `client`, de otro hart: en una sola pasada despierta al
+/// cliente y recalcula el suelo del servidor con los clientes que le quedan.
+/// Mismos cerrojos que `wakeInheriting`. Si `blocking`, el servidor (el hilo
+/// actual) va a bloquearse ya: este hart elegirá de todos modos y no hace
+/// falta mirar si debe ceder. Con el cerrojo global.
+pub fn replyWaking(server: u64, client: u64, blocking: bool) void {
+    const saved = riscv.interruptsOffSaving();
+    _ = rightShared(me());
+    var held = hartBit(homeOf(server)) | hartBit(homeOf(client));
+    var targets: u64 = 0;
+    var status: u64 = undefined;
+    while (true) {
+        kernel_lock.enterHarts(held);
+        status = abi.fb_inherit_reply_wake(server, client, held, &targets);
+        kernel_lock.leaveHarts();
+        if (status != abi.FB_INHERIT_UNHELD or held == kernel_lock.all_harts) break;
+        count(&unheld_count);
+        held = kernel_lock.all_harts;
+    }
+    riscv.restoreInterruptState(saved);
+    if (status != abi.FB_SCHED_OK) @panic("no se pudo responder heredando");
+    notifyHarts(if (blocking) targets & ~hartBit(me()) else targets);
+}
+
 /// Recalcula toda la cadena de espera que empieza en `server`
 /// (SPARK: Inherit_Gate.Refresh_Chain). Con el cerrojo global.
 pub fn refreshFloorChain(server: u64) void {
@@ -714,7 +775,7 @@ pub fn runningOn(h: hart.Index) u64 {
     return abi.fb_sched_running(right(h));
 }
 
-pub fn currentId() u64 {
+pub inline fn currentId() u64 {
     return here().current;
 }
 

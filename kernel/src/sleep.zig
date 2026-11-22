@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Hilos dormidos hasta un instante. SPARK guarda los vencimientos y demuestra
 //! que nadie despierta antes del suyo; el temporizador se programa con el más
 //! próximo, así que tampoco nadie se queda dormido sin interrupción prevista.

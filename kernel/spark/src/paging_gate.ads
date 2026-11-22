@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 --  Frontera de la paginación con el resto de lenguajes.
 --
 --  Construye las tablas del kernel en una sola llamada: así la invariante de

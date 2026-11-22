@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /*
  * Mide en Linux las mismas operaciones que el benchmark de Fabianus, en
  * instrucciones retiradas con QEMU en -icount. Es el /init de un initramfs:

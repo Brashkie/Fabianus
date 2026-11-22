@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Cambio de contexto entre hilos del kernel. Solo guarda lo que la convención
  * de llamada obliga a conservar: el resto ya lo salvó quien llamó.

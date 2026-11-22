@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Parada y apagado de la máquina. El apagado solo existe en QEMU `virt`.
 
 const abi = @import("abi.zig").c;

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Rutinas de memoria que los compiladores pueden invocar implícitamente.
  * Están en ensamblador para que el optimizador no convierta el bucle en una

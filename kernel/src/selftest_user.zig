@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Autopruebas del modo usuario, los espacios de direcciones y las llamadas al sistema.
 
 const abi = @import("abi.zig").c;

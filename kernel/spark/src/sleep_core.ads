@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 --  Núcleo demostrado de los hilos dormidos: cada uno espera hasta un instante.
 --
 --  El kernel pregunta por el vencimiento más próximo para programar el

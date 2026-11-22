@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Manejador de panic propio. Sustituye a `std.debug.FullPanic`, que metería
 //! en el kernel el formateador de la biblioteca estándar de Zig.
 //! Zig exige exactamente estos nombres en el espacio de nombres `panic` raíz.

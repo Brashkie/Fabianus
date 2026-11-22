@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Importa una sola vez la ABI común para que todos los módulos compartan tipos.
 
 pub const c = @cImport(@cInclude("fabianus.h"));

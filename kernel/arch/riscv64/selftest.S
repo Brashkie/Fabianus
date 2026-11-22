@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Comprueba que un trap conserva todos los registros: carga en cada uno un
  * valor distinto, provoca un breakpoint y verifica los valores al volver.

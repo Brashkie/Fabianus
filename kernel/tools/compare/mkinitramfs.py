@@ -1,7 +1,10 @@
-"""Crea un initramfs mínimo (cpio newc) con /init, /hello y /dev/console.
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Crea un initramfs mínimo (cpio newc) con /init, /hello y /dev/console, y
+los archivos extra que se le den (en la raíz, con su nombre).
 
-Uso: mkinitramfs.py <init> <hello> <salida.cpio>
+Uso: mkinitramfs.py <init> <hello> <salida.cpio> [extra ...]
 """
+import os
 import sys
 
 
@@ -18,12 +21,15 @@ def entry(ino, name, mode, data=b'', rdev=(0, 0)):
 
 def main():
     init, hello, output = sys.argv[1:4]
+    extras = [entry(10 + i, os.path.basename(path), 0o100644, open(path, 'rb').read())
+              for i, path in enumerate(sys.argv[4:])]
     archive = b''.join([
         entry(1, 'dev', 0o040755),
         entry(2, 'dev/console', 0o020600, rdev=(5, 1)),
         entry(3, 'proc', 0o040555),
         entry(4, 'init', 0o100755, open(init, 'rb').read()),
         entry(5, 'hello', 0o100755, open(hello, 'rb').read()),
+    ] + extras + [
         entry(0, 'TRAILER!!!', 0),
     ])
     archive += b'\0' * (-len(archive) % 512)

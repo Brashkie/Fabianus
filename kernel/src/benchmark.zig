@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Mide el asignador de marcos en instrucciones ejecutadas.
 //! Solo es válido con QEMU en `-icount`; las instrucciones no equivalen a tiempo.
 
@@ -9,6 +10,7 @@ const kernel_lock = @import("kernel_lock.zig");
 const ipc = @import("ipc.zig");
 const memory = @import("memory.zig");
 const process = @import("process.zig");
+const region = @import("region.zig");
 const riscv = @import("riscv.zig");
 const selftest_sched = @import("selftest_sched.zig");
 const spinlock = @import("spinlock.zig");
@@ -883,6 +885,131 @@ fn measureStaleInheritance(harts: u64) void {
     uart.print(" (5 veces)\n");
 }
 
+// Memoria compartida (Hito 33). Van al final: el orden de las medidas cambia
+// los resultados (cuanto adaptativo).
+
+const copy_rounds: u64 = 64;
+
+fn regionGrant(slot: u64, number: u64, rights: u64) process.Grant {
+    return .{ .slot = slot, .kind = abi.FB_CAP_REGION, .object = region.object(number), .rights = rights };
+}
+
+/// 4 KiB de un proceso a otro de otro hart y una suma de vuelta, por una
+/// región compartida: una llamada por cada 4 KiB.
+fn sharedOnce(rounds: u64) u64 {
+    const number = region.create(1) orelse @panic("benchmark: no se pudo crear la region");
+    const consumer = process.spawnWithOn(1, .bench_shm_consume, 0, &.{ regionGrant(0, number, recv_right), endpointGrant(1, 0, recv_right) }) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(consumer, abi.FB_PRIO_NORMAL, abi.FB_SCHED_MAX_BUDGET);
+    while (thread.state(consumer) != abi.FB_THREAD_BLOCKED) thread.yield();
+    const producer = process.spawnWithOn(0, .bench_shm_produce, rounds, &.{ regionGrant(0, number, send_right | recv_right), endpointGrant(1, 0, send_right) }) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(producer, abi.FB_PRIO_NORMAL, abi.FB_SCHED_MAX_BUDGET);
+    region.release(number);
+    const total = sleepUntilExit(producer).value;
+    _ = waitForResult(consumer);
+    if (region.alive(number)) @panic("benchmark: la region no se libero");
+    return total;
+}
+
+/// Lo mismo copiando: 128 llamadas de 32 bytes por cada 4 KiB.
+fn copyOnce(rounds: u64) u64 {
+    const consumer = process.spawnWithOn(1, .bench_copy_consume, 0, &.{endpointGrant(0, 0, recv_right)}) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(consumer, abi.FB_PRIO_NORMAL, abi.FB_SCHED_MAX_BUDGET);
+    while (thread.state(consumer) != abi.FB_THREAD_BLOCKED) thread.yield();
+    const producer = process.spawnWithOn(0, .bench_copy_produce, rounds, &.{endpointGrant(0, 0, send_right)}) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(producer, abi.FB_PRIO_NORMAL, abi.FB_SCHED_MAX_BUDGET);
+    const total = sleepUntilExit(producer).value;
+    _ = waitForResult(consumer);
+    return total;
+}
+
+fn measureSharedPass() void {
+    var shared_runs: [x_repeats]u64 = undefined;
+    for (&shared_runs) |*run_| run_.* = sharedOnce(x_rounds);
+    uart.print("4 KiB entre harts por una region compartida (escribir, llamar, leer y sumar): ");
+    printSpread(shared_runs, x_rounds);
+    uart.print(" por cada 4 KiB (5 x 4096)\n");
+
+    var copy_runs: [x_repeats]u64 = undefined;
+    for (&copy_runs) |*run_| run_.* = copyOnce(copy_rounds);
+    uart.print("4 KiB entre harts copiados por IPC (128 llamadas de 32 bytes): ");
+    printSpread(copy_runs, copy_rounds);
+    uart.print(" por cada 4 KiB (5 x 64)\n");
+}
+
+/// Mapear una región de 16 páginas y escribir en cada una, desde el proceso.
+/// Aparte, lo que cuesta crearla en el kernel (reservar y borrar las 16
+/// páginas), que en Linux va dentro de los fallos de página de la primera
+/// escritura.
+fn measureRegionMap() void {
+    var runs: [x_repeats]u64 = undefined;
+    var creates: [x_repeats]u64 = undefined;
+    for (&runs, &creates) |*run_, *create_| {
+        const begin = timer.now();
+        const number = region.create(16) orelse @panic("benchmark: no se pudo crear la region");
+        create_.* = timer.now() - begin;
+        const id = process.spawnWithOn(0, .bench_shm_map, 0, &.{regionGrant(0, number, send_right | recv_right)}) orelse @panic("no se pudo crear el proceso");
+        region.release(number);
+        run_.* = sleepUntilExit(id).value;
+    }
+    uart.print("mapear una region de 64 KiB y escribir en sus 16 paginas: ");
+    printSpread(runs, 1);
+    uart.print("; crearla en el kernel (reservar y borrar): ");
+    printSpread(creates, 1);
+    uart.print(" (5 veces)\n");
+}
+
+// Disco (Hito 34): 4 KiB por llamada a través del driver en Rust, con los
+// datos en una región compartida y DMA. Al final, como las demás medidas nuevas.
+
+const disk_rounds: u64 = 256;
+
+fn diskOnce(driver_hart: u64, operation: u64) u64 {
+    const queue = region.create(1) orelse @panic("benchmark: sin region para la cola");
+    const data = region.create(1) orelse @panic("benchmark: sin region para los datos");
+    const driver = process.spawnWithOn(driver_hart, .disk_driver, 0, &.{
+        endpointGrant(0, 0, recv_right),
+        .{ .slot = 1, .kind = abi.FB_CAP_DEVICE, .object = abi.FB_DEVICE_DISK, .rights = send_right | recv_right },
+        endpointGrant(2, 1, recv_right),
+        regionGrant(3, queue, send_right | recv_right),
+        regionGrant(4, data, send_right | recv_right),
+    }) orelse @panic("no se pudo crear el driver");
+    thread.setParams(driver, abi.FB_PRIO_NORMAL, abi.FB_SCHED_MAX_BUDGET);
+    while (thread.state(driver) != abi.FB_THREAD_BLOCKED) thread.yield();
+    const client = process.spawnWithOn(0, .bench_disk, disk_rounds | operation << 32, &.{
+        endpointGrant(0, 0, send_right),
+        regionGrant(1, data, send_right | recv_right),
+    }) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(client, abi.FB_PRIO_NORMAL, abi.FB_SCHED_MAX_BUDGET);
+    region.release(queue);
+    region.release(data);
+    const total = sleepUntilExit(client).value;
+    _ = waitForResult(driver);
+    return total;
+}
+
+fn measureDisk(harts: u64) void {
+    const cases = [_]struct { hart: u64, operation: u64, name: []const u8 }{
+        .{ .hart = 0, .operation = abi.FB_DISK_OP_READ, .name = "leer 4 KiB del disco, driver en el mismo hart" },
+        .{ .hart = 0, .operation = abi.FB_DISK_OP_WRITE, .name = "escribir 4 KiB en el disco, driver en el mismo hart" },
+        .{ .hart = 1, .operation = abi.FB_DISK_OP_READ, .name = "leer 4 KiB del disco, driver en otro hart" },
+        .{ .hart = 1, .operation = abi.FB_DISK_OP_WRITE, .name = "escribir 4 KiB en el disco, driver en otro hart" },
+    };
+    for (cases) |case| {
+        if (case.hart >= harts) continue;
+        var runs: [x_repeats]u64 = undefined;
+        for (&runs) |*run_| run_.* = diskOnce(case.hart, case.operation);
+        const s = sorted(runs);
+        uart.print(case.name);
+        uart.print(": ");
+        uart.printDecimal(s[0] / disk_rounds);
+        uart.print(" instrucciones de toda la maquina (minima; mediana ");
+        uart.printDecimal(s[x_repeats / 2] / disk_rounds);
+        uart.print(", maxima ");
+        uart.printDecimal(s[x_repeats - 1] / disk_rounds);
+        uart.print(") (5 x 256)\n");
+    }
+}
+
 pub fn runSmp(harts: u64) void {
     uart.print("benchmark con ");
     uart.printDecimal(harts);
@@ -899,5 +1026,8 @@ pub fn runSmp(harts: u64) void {
     measurePingPong("llamada y respuesta entre harts", 0, 1);
     measureCrossInversion(1);
     measureStaleInheritance(harts);
+    measureSharedPass();
+    measureRegionMap();
+    measureDisk(harts);
     thread.setParams(0, abi.FB_PRIO_NORMAL, abi.FB_SCHED_DEFAULT_BUDGET);
 }

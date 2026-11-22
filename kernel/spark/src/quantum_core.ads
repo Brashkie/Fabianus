@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 --  Cuanto de turno que se adapta al coste de cambiar de contexto.
 --
 --  El kernel mide cuánto tarda cada cambio de hilo y lleva una media móvil con

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Acceso a registros de control de RISC-V desde modo supervisor.
 
 const kernel_lock = @import("kernel_lock.zig");

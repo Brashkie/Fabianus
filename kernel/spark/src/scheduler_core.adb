@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 package body Scheduler_Core with
   SPARK_Mode
 is
@@ -469,6 +470,9 @@ is
    end Return_To;
 
    procedure Wake (M : in out Model; X : Thread_Id) is
+      Was_Quiet  : constant Boolean := Quiet (M, X) with Ghost;
+      Old_Ctx    : constant Link_Table := M.Ctx with Ghost;
+      Old_Levels : constant Priority_Table := M.Levels with Ghost;
    begin
       if M.Lent (X) /= X then
          declare
@@ -504,9 +508,12 @@ is
       pragma Assert (Links_Ok (M));
       pragma Assert (if M.Ctx (X) /= X then M.Lent (M.Ctx (X)) = X);
       pragma Assert (for all T in Thread_Id => (if M.Ctx (T) = X then T = X));
+      pragma Assert (if Was_Quiet then M.Ctx = Old_Ctx and then M.Levels = Old_Levels);
       M.States (X) := Ready;
       pragma Assert (Links_Ok (M));
       Refresh (M, X);
+      pragma Assert (Valid (M));
+      pragma Assert (if Was_Quiet then M.Ctx = Old_Ctx and then M.Levels = Old_Levels);
    end Wake;
 
    procedure Hand_Off

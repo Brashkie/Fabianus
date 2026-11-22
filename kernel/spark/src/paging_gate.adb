@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 package body Paging_Gate with
   SPARK_Mode,
   Refined_State => (State => (Pool, Built))

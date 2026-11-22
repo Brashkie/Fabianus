@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 --  Frontera del asignador con el resto de lenguajes.
 --
 --  Los demás lenguajes no pueden demostrar las precondiciones de Frame_Bitmap,

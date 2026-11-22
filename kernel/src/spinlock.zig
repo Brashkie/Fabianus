@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Cerrojo de giro para varios harts.
 //!
 //! Adquirir es un amoswap.w.aq que pone 1 y devuelve lo que había: solo entra

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Llamadas al sistema. El kernel nunca toca una dirección de usuario directamente:
 //! cada página se traduce con la función demostrada en SPARK y se lee por su
 //! dirección física. Por eso sstatus.SUM está siempre a cero.
@@ -9,6 +10,7 @@ const abi = @import("abi.zig").c;
 const device = @import("device.zig");
 const ipc = @import("ipc.zig");
 const process = @import("process.zig");
+const region = @import("region.zig");
 const sleep = @import("sleep.zig");
 const thread = @import("thread.zig");
 const uart = @import("uart.zig");
@@ -91,6 +93,12 @@ pub fn handle(frame: *abi.fb_trap_frame) void {
     }
     frame.sepc += ecall_length;
 
+    // Con una orden de morir pendiente no se atiende nada: si no, una espera
+    // sin fin (dormir, recibir sin emisor) la dejaría sin cumplir para
+    // siempre. requestKill toma el global, así que o la vemos aquí o llega
+    // cuando ya esperamos y cancela la espera.
+    if (process.killRequestedAt(frame)) process.terminateCurrent(.{ .kind = .killed });
+
     const a0 = frame.regs[reg_a0];
     frame.regs[reg_a0] = switch (frame.regs[reg_a7]) {
         abi.FB_SYS_EXIT => process.terminateCurrent(.{ .kind = .exited, .value = a0 }),
@@ -114,6 +122,8 @@ pub fn handle(frame: *abi.fb_trap_frame) void {
         abi.FB_SYS_SCHED_SET => schedSet(a0, frame.regs[reg_a1], frame.regs[reg_a2]),
         abi.FB_SYS_DEFER => ipc.deferReply(frame),
         abi.FB_SYS_REPLY_TO => ipc.replyTo(frame),
+        abi.FB_SYS_REGION_MAP => region.map(process.currentSpace(), a0, frame.regs[reg_a1]),
+        abi.FB_SYS_DMA_ADDRESS => region.dmaAddress(process.currentSpace(), a0, frame.regs[reg_a1], frame.regs[reg_a2]),
         abi.FB_SYS_SLEEP_UNTIL => blk: {
             const status = sleep.sleepUntil(a0);
             // Si lo despertaron para matarlo, muere ya.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Autopruebas de las prioridades y de los presupuestos de CPU.
 
 const abi = @import("abi.zig").c;

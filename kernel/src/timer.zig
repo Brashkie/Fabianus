@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Timer periódico de supervisor basado en la extensión Sstc. Cada hart tiene
 //! el suyo (stimecmp es por hart), así que el estado va por hart.
 

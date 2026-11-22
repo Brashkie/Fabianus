@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 with Frame_Bitmap; use Frame_Bitmap;
 
 package body Frame_Gate with

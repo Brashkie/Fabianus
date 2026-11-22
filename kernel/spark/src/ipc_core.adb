@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 package body Ipc_Core with
   SPARK_Mode,
   Refined_State => (State => (Table, Where, Pending, Reply_To, Waiting, Calling, Held))

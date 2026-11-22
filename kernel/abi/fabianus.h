@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * ABI común de Fabianus: única fuente de verdad entre lenguajes.
  * Este archivo se incluye tanto desde ensamblador como desde Zig.
@@ -15,6 +16,28 @@
 /* Dispositivos de la máquina `virt` de QEMU. */
 #define FB_UART0_BASE 0x10000000
 #define FB_UART0_IRQ 10
+/* Disco virtio-blk (virtio-mmio moderno, versión 2) en la primera ranura de
+   QEMU virt: -device virtio-blk-device,bus=virtio-mmio-bus.0. */
+#define FB_VIRTIO0_BASE 0x10001000
+#define FB_VIRTIO0_IRQ 1
+
+/* Protocolo del driver de disco (drivers/disk). Un cliente comparte con él
+   una región de datos y le llama: a1 = operación, a2 = primer sector, a3 =
+   página de la región. Cada lectura o escritura mueve una página (8 sectores
+   de 512 bytes). Contesta en a1 un FB_DISK_* y, para CAPACITY, en a2 el número
+   de sectores. Con STOP contesta y termina. */
+#define FB_DISK_OP_STOP 0
+#define FB_DISK_OP_READ 1
+#define FB_DISK_OP_WRITE 2
+#define FB_DISK_OP_CAPACITY 3
+#define FB_DISK_OK 0
+#define FB_DISK_ERR_REQUEST 1
+#define FB_DISK_ERR_IO 2
+#define FB_DISK_SECTOR_BYTES 512
+#define FB_DISK_SECTORS_PER_PAGE 8
+/* Donde el driver mapea su cola (una página) y la región de datos. */
+#define FB_DISK_QUEUE_BASE 0x104000000
+#define FB_DISK_DATA_BASE 0x104010000
 #define FB_PLIC_BASE 0x0c000000
 #define FB_PLIC_SIZE 0x400000UL
 /* CLINT: el supervisor solo puede escribir las palabras msip de los harts
@@ -81,7 +104,11 @@
 #define FB_USER_STACK_TOP 0x101000000
 #define FB_USER_STACK_PAGES 4
 #define FB_USER_DEVICE_BASE 0x102000000
+/* Donde los programas de prueba mapean una región compartida. */
+#define FB_USER_SHARED_BASE 0x104000000
 #define FB_USPACE_MAX 4
+#define FB_USPACE_MAX_REGIONS 4
+#define FB_USPACE_MAX_REGION_PAGES 16
 #define FB_USPACE_MAX_LEAF_TABLES 5
 #define FB_USPACE_OK 0UL
 #define FB_USPACE_INVALID 1UL
@@ -113,6 +140,13 @@
 #define FB_SYS_REPLY_TO 18
 /* a0 = instante absoluto, en unidades de FB_TIMEBASE_HZ. */
 #define FB_SYS_SLEEP_UNTIL 19
+/* a0 = capability de región, a1 = dirección. Mapea todas sus páginas desde
+   a1: para escribir si la capability tiene Send, si no solo para leer. */
+#define FB_SYS_REGION_MAP 20
+/* a0 = capability de región, a1 = página, a2 = capability del disco (Send).
+   Devuelve la dirección física de esa página, para programar DMA, solo si
+   quien llama está unido a la región y tiene los registros del disco. */
+#define FB_SYS_DMA_ADDRESS 21
 #define FB_SYS_WRITE_MAX 256
 #define FB_ERR_NOSYS 0xffffffffffffffff
 #define FB_ERR_FAULT 0xfffffffffffffffe
@@ -127,7 +161,12 @@
 #define FB_CAP_CONSOLE 2
 #define FB_CAP_DEVICE 3
 #define FB_CAP_SCHED 4
+/* Región compartida: el objeto es el número de región - 1. Recv deja mapearla
+   para leer y Send, además, para escribir. */
+#define FB_CAP_REGION 5
 #define FB_DEVICE_UART 0
+#define FB_DEVICE_DISK 1
+#define FB_DEVICE_COUNT 2
 #define FB_RIGHT_SEND 1
 #define FB_RIGHT_RECV 2
 #define FB_RIGHT_GRANT 4
@@ -250,8 +289,21 @@ uint64_t fb_uspace_map(uint64_t space, uint64_t va, uint64_t perm);
 /* Dirección física de la página, o 0 si no es accesible en ese modo. */
 uint64_t fb_uspace_translate(uint64_t space, uint64_t va, uint64_t mode);
 uint64_t fb_uspace_destroy(uint64_t space);
-/* Mapea la UART en un solo espacio a la vez. Devuelve FB_USPACE_*. */
-uint64_t fb_uspace_map_device(uint64_t space, uint64_t va);
+/* Mapea los registros de un dispositivo (FB_DEVICE_*) en un solo espacio a
+   la vez. Devuelve FB_USPACE_*. */
+uint64_t fb_uspace_map_device(uint64_t space, uint64_t device, uint64_t va);
+/* Regiones compartidas. Crear devuelve la región (1 .. 4) o 0; frame, la
+   dirección física de una página o 0; in_use, 1 si algún espacio está unido.
+   Las demás devuelven FB_USPACE_*. */
+uint64_t fb_uspace_region_create(uint64_t pages);
+uint64_t fb_uspace_region_frame(uint64_t region, uint64_t page);
+uint64_t fb_uspace_region_attach(uint64_t space, uint64_t region);
+uint64_t fb_uspace_region_map(uint64_t space, uint64_t region, uint64_t page, uint64_t va,
+                              uint64_t writable);
+uint64_t fb_uspace_region_in_use(uint64_t region);
+/* Como region_frame, pero solo si el espacio está unido a la región. */
+uint64_t fb_uspace_region_frame_for(uint64_t space, uint64_t region, uint64_t page);
+uint64_t fb_uspace_region_free(uint64_t region);
 
 /* Capabilities, demostradas en SPARK. fb_cap_grant es solo para el kernel. */
 uint64_t fb_cap_grant(uint64_t proc, uint64_t slot, uint64_t kind, uint64_t object, uint64_t rights);
@@ -263,6 +315,8 @@ uint64_t fb_cap_delete(uint64_t proc, uint64_t slot);
 uint64_t fb_cap_clear(uint64_t proc);
 uint64_t fb_cap_holds_receive(uint64_t proc, uint64_t object);
 uint64_t fb_cap_other_receiver(uint64_t proc, uint64_t object);
+/* 1 si alguna capability de ese tipo nombra ese objeto. */
+uint64_t fb_cap_refers(uint64_t kind, uint64_t object);
 
 /* Colas de IPC, demostradas en SPARK. Devuelven el hilo emparejado o FB_IPC_*. */
 uint64_t fb_ipc_send(uint64_t endpoint, uint64_t thread);
@@ -319,13 +373,22 @@ uint64_t fb_sched_boost(uint64_t thread, uint64_t level);
 uint64_t fb_sched_priority_of(uint64_t thread);
 uint64_t fb_sched_floor_of(uint64_t thread); /* Suelo heredado, o FB_SCHED_NONE. */
 uint64_t fb_sched_has_floor(uint64_t thread); /* 1 si hereda un suelo distinto de 0. */
+/* Boost y despertar en una sola operación; solo si despertar no le quita un
+   contexto a nadie (si no, FB_SCHED_WRONG_STATE). */
+uint64_t fb_sched_wake_boost(uint64_t thread, uint64_t level);
 
 /* Herencia de prioridad (Inherit_Gate). Con el cerrojo global y los de
-   todos los harts. */
+   todos los harts, salvo las dos últimas: con los de `held` (un bit por
+   hart), que comprueban ellas mismas que bastan (si no, FB_INHERIT_UNHELD). */
 #define FB_INHERIT_CYCLE 6UL
+#define FB_INHERIT_UNHELD 7UL
 uint64_t fb_inherit_refresh(uint64_t server);
 uint64_t fb_inherit_refresh_chain(uint64_t server, uint64_t *notify);
 uint64_t fb_inherit_holds(void);
+/* Llamar y heredar: recalcula el suelo del servidor y lo despierta. */
+uint64_t fb_inherit_call_wake(uint64_t server, uint64_t held);
+/* Responder y heredar: despierta al cliente y recalcula el suelo del servidor. */
+uint64_t fb_inherit_reply_wake(uint64_t server, uint64_t client, uint64_t held, uint64_t *notify);
 
 /* Cuanto de turno adaptado al coste de cambiar de contexto, demostrado en SPARK. */
 uint64_t fb_quantum_update(uint64_t estimate, uint64_t sample);

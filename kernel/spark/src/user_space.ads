@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 --  Espacios de direcciones de usuario, demostrados en SPARK.
 --
 --  Invariante inductiva (Invariant): la establece el estado inicial y la
@@ -6,15 +7,25 @@
 --  privada de este paquete. De ella se deduce:
 --
 --    * Toda hoja de usuario lleva U, no lleva G y nunca es W+X.
---    * Toda hoja de un espacio apunta a un marco cuyo único dueño es ese espacio.
+--    * Toda hoja de un espacio apunta a un marco suyo o a un marco de una
+--      región compartida a la que ese espacio está unido.
+--    * Cada marco tiene a lo sumo un dueño: un espacio o una región.
 --    * Las tablas de un espacio solo apuntan a tablas del mismo espacio.
 --    * Las entradas raíz del kernel son punteros a tablas, nunca hojas.
 --    * Ningún marco de usuario puede ser una tabla de páginas.
 --    * La página del dispositivo tiene como mucho un dueño y no es un marco.
 --
---  Lemma_Isolation enuncia el teorema: dos espacios distintos nunca traducen a
---  un mismo marco. Walk modela el recorrido del hardware; que el procesador se
---  comporte así es una suposición.
+--  Lemma_Isolation enuncia el teorema: dos espacios distintos solo traducen a
+--  un mismo marco si es de una región compartida unida a los dos. Un marco
+--  propio de un espacio nunca es accesible desde otro (Lemma_Private). Walk
+--  modela el recorrido del hardware; que el procesador se comporte así es una
+--  suposición.
+--
+--  Regiones compartidas. Una región es una lista de marcos cuyo dueño es la
+--  región, no un espacio. Un espacio solo puede mapear sus páginas después de
+--  unirse a ella (Region_Attach), y solo deja de estar unido al destruirse.
+--  Una región solo se libera cuando ningún espacio está unido. Quién puede
+--  unirse lo decide el kernel con una capability (Cap_Core).
 --
 --  No es reentrante: quien llama debe tener las interrupciones apagadas.
 
@@ -29,16 +40,37 @@ package User_Space with
   Initializes       => State,
   Initial_Condition => Invariant
 is
-   Max_Spaces : constant := 4;
+   Max_Spaces       : constant := 4;
+   Max_Regions      : constant := 4;
+   Max_Region_Pages : constant := 16;
 
-   type Owner_Tag is range 0 .. Max_Spaces with Size => 8;
+   --  Dueño de un marco: nadie, un espacio (1 .. 4) o una región (5 .. 8: la
+   --  región R tiene el dueño Max_Spaces + R).
+   type Owner_Tag is range 0 .. Max_Spaces + Max_Regions with Size => 8;
    subtype Space_Id is Owner_Tag range 1 .. Max_Spaces;
+   subtype Holder_Id is Owner_Tag range 1 .. Owner_Tag'Last;
+   subtype Region_Tag is Owner_Tag range Max_Spaces + 1 .. Owner_Tag'Last;
    No_Owner : constant Owner_Tag := 0;
 
    Page_Bytes : constant U64 := 2**12;
 
-   --  Registros de la UART (FB_UART0_BASE). No pertenece al conjunto de marcos.
-   Device_Ppn : constant U64 := 16#10000#;
+   --  Páginas de registros de dispositivos que se pueden ceder, cada una a un
+   --  solo espacio: 0, la UART (FB_UART0_BASE); 1, el disco virtio
+   --  (FB_VIRTIO0_BASE). No pertenecen al conjunto de marcos.
+   Max_Devices : constant := 2;
+   type Device_Id is range 0 .. Max_Devices - 1;
+   type Device_Map is array (Device_Id) of Owner_Tag;
+
+   function Device_Ppn (D : Device_Id) return U64 is
+     (if D = 0 then 16#10000# else 16#10001#);
+
+   --  Definida con la tabla de arriba: no puede quedarse atrás si se añade un
+   --  dispositivo (una mutación de una copia aparte sobrevivía).
+   function Is_Device_Ppn (Ppn : U64) return Boolean is
+     (for some D in Device_Id => Ppn = Device_Ppn (D));
+
+   function Valid_Device (Device : U64) return Boolean is
+     (Device < U64 (Max_Devices));
 
    --  El usuario vive en las entradas raíz 4 .. 255. Las 0 .. 3 son del kernel.
    Kernel_Root_Slots : constant := 4;
@@ -63,6 +95,13 @@ is
 
    function Valid_Space (Space : U64) return Boolean is
      (Space >= 1 and then Space <= U64 (Max_Spaces));
+
+   function Valid_Region (Region : U64) return Boolean is
+     (Region >= 1 and then Region <= U64 (Max_Regions));
+
+   function Tag_Of (Region : U64) return Region_Tag is
+     (Region_Tag (U64 (Max_Spaces) + Region))
+   with Pre => Valid_Region (Region);
 
    function Valid_Perm (Perm : U64) return Boolean is
      (Perm >= 1 and then Perm <= 3);
@@ -108,8 +147,28 @@ is
      Ghost,
      Global => (Input => State);
 
-   --  Espacio que tiene el dispositivo, o No_Owner.
-   function Device_Holder return Owner_Tag with
+   --  Espacio que tiene cada dispositivo, o No_Owner.
+   function Device_Holders return Device_Map with
+     Ghost,
+     Global => (Input => State);
+
+   --  S está unido a la región R.
+   function Attached_To (R : Region_Tag; S : Space_Id) return Boolean with
+     Ghost,
+     Global => (Input => State);
+
+   --  El marco es de una región unida a A y a B.
+   function Shared_By (Ppn : U64; A, B : Space_Id) return Boolean with
+     Ghost,
+     Global => (Input => State);
+
+   --  El marco es de S y solo de S (no es de ninguna región ni el dispositivo).
+   function Private_To (Ppn : U64; S : Space_Id) return Boolean with
+     Ghost,
+     Global => (Input => State);
+
+   --  Número de páginas de la región R (0 si no existe).
+   function Pages_Of (R : Region_Tag) return U64 with
      Ghost,
      Global => (Input => State);
 
@@ -122,7 +181,8 @@ is
        Is_User_Leaf (Walk (S, Va))
        and then Frame_Owner_Is (Ppn_Of (Walk (S, Va)), S);
 
-   --  Teorema de aislamiento entre espacios de direcciones.
+   --  Teorema de aislamiento entre espacios de direcciones: dos espacios
+   --  distintos solo llegan al mismo marco si es de una región unida a ambos.
    procedure Lemma_Isolation (A, B : Space_Id; Va_A, Va_B : U64) with
      Ghost,
      Global => (Input => State),
@@ -133,6 +193,22 @@ is
        and then In_User_Window (Va_B)
        and then Walk (A, Va_A) /= 0
        and then Walk (B, Va_B) /= 0,
+     Post   =>
+       Ppn_Of (Walk (A, Va_A)) /= Ppn_Of (Walk (B, Va_B))
+       or else Shared_By (Ppn_Of (Walk (A, Va_A)), A, B);
+
+   --  Un marco propio de A no lo traduce ningún otro espacio.
+   procedure Lemma_Private (A, B : Space_Id; Va_A, Va_B : U64) with
+     Ghost,
+     Global => (Input => State),
+     Pre    =>
+       Invariant
+       and then A /= B
+       and then In_User_Window (Va_A)
+       and then In_User_Window (Va_B)
+       and then Walk (A, Va_A) /= 0
+       and then Walk (B, Va_B) /= 0
+       and then Private_To (Ppn_Of (Walk (A, Va_A)), A),
      Post   => Ppn_Of (Walk (A, Va_A)) /= Ppn_Of (Walk (B, Va_B));
 
    --  Solo puede completarse una vez. La reserva de tablas debe estar por
@@ -192,22 +268,26 @@ is
      Convention    => C,
      External_Name => "fb_uspace_map";
 
-   --  Mapea los registros del dispositivo en Va, sin ejecución. Solo puede
-   --  tenerlos un espacio a la vez: quien llega después recibe un error.
-   function Map_Device (Space, Va : U64) return U64 with
+   --  Mapea los registros del dispositivo Device en Va, sin ejecución. Solo
+   --  puede tenerlos un espacio a la vez: quien llega después recibe un error.
+   function Map_Device (Space, Device, Va : U64) return U64 with
      Side_Effects,
      Global        => (In_Out => State),
      Pre           => Invariant,
      Post          =>
        Invariant
-       and then (if Device_Holder'Old /= No_Owner then Map_Device'Result /= Status_Ok)
+       and then
+         (if Valid_Device (Device) and then Device_Holders'Old (Device_Id (Device)) /= No_Owner
+          then Map_Device'Result /= Status_Ok)
        and then
          (if Map_Device'Result = Status_Ok
           then Valid_Space (Space)
+            and then Valid_Device (Device)
             and then In_User_Window (Va)
             and then Va mod Page_Bytes = 0
-            and then Device_Holder = Space_Id (Space)
-            and then Walk (Space_Id (Space), Va) = User_Leaf (Device_Ppn, Read_Write)),
+            and then Device_Holders (Device_Id (Device)) = Space_Id (Space)
+            and then
+              Walk (Space_Id (Space), Va) = User_Leaf (Device_Ppn (Device_Id (Device)), Read_Write)),
      Export,
      Convention    => C,
      External_Name => "fb_uspace_map_device";
@@ -223,7 +303,7 @@ is
           and then In_User_Window (Va)
           and then (Mode = Access_Read or else Mode = Access_Write)
           and then Translate'Result mod Page_Bytes = 0
-          and then Translate'Result / Page_Bytes /= Device_Ppn
+          and then not Is_Device_Ppn (Translate'Result / Page_Bytes)
           and then Translate'Result / Page_Bytes = Ppn_Of (Walk (Space_Id (Space), Va))
           and then Frame_Owner_Is (Translate'Result / Page_Bytes, Space_Id (Space))
           and then
@@ -233,8 +313,129 @@ is
      Convention    => C,
      External_Name => "fb_uspace_translate";
 
-   --  Libera todos los marcos del espacio y lo deja vacío. Quien llama no debe
-   --  estar usando estas tablas.
+   --  Crea una región de Pages marcos (1 .. Max_Region_Pages), sin ningún
+   --  espacio unido. Devuelve su número (1 .. Max_Regions) o 0 si no quedan
+   --  regiones o marcos; entonces no se queda con nada. Quien llama debe
+   --  poner las páginas a cero (Region_Frame) antes de que nadie las vea.
+   function Region_Create (Pages : U64) return U64 with
+     Side_Effects,
+     Global        => (In_Out => (State, Frame_Gate.State)),
+     Pre           => Invariant,
+     Post          =>
+       Invariant
+       and then Region_Create'Result <= U64 (Max_Regions)
+       and then
+         (if Region_Create'Result /= 0
+          then Pages in 1 .. U64 (Max_Region_Pages)
+            and then Pages_Of (Tag_Of (Region_Create'Result)) = Pages
+            and then
+              (for all S in Space_Id => not Attached_To (Tag_Of (Region_Create'Result), S))),
+     Export,
+     Convention    => C,
+     External_Name => "fb_uspace_region_create";
+
+   --  Dirección física de la página Page (0 .. Pages - 1) de la región, o 0.
+   function Region_Frame (Region, Page : U64) return U64 with
+     Global        => (Input => State),
+     Pre           => Invariant,
+     Post          =>
+       (if Region_Frame'Result /= 0
+        then Valid_Region (Region)
+          and then Page < Pages_Of (Tag_Of (Region))
+          and then Region_Frame'Result mod Page_Bytes = 0),
+     Export,
+     Convention    => C,
+     External_Name => "fb_uspace_region_frame";
+
+   --  Une el espacio a la región: desde entonces puede mapear sus páginas.
+   --  Quien llama comprueba antes la capability.
+   function Region_Attach (Space, Region : U64) return U64 with
+     Side_Effects,
+     Global        => (In_Out => State),
+     Pre           => Invariant,
+     Post          =>
+       Invariant
+       and then
+         (if Region_Attach'Result = Status_Ok
+          then Valid_Space (Space)
+            and then Valid_Region (Region)
+            and then Pages_Of (Tag_Of (Region)) > 0
+            and then Attached_To (Tag_Of (Region), Space_Id (Space))),
+     Export,
+     Convention    => C,
+     External_Name => "fb_uspace_region_attach";
+
+   --  Mapea la página Page de la región en Va, solo lectura o lectura y
+   --  escritura (nunca ejecución). Solo si el espacio está unido a la región.
+   function Region_Map (Space, Region, Page, Va, Writable : U64) return U64 with
+     Side_Effects,
+     Global        => (In_Out => State),
+     Pre           => Invariant,
+     Post          =>
+       Invariant
+       and then
+         (if Region_Map'Result = Status_Ok
+          then Valid_Space (Space)
+            and then Valid_Region (Region)
+            and then In_User_Window (Va)
+            and then Attached_To (Tag_Of (Region), Space_Id (Space))
+            and then Page < Pages_Of (Tag_Of (Region))
+            and then Walk (Space_Id (Space), Va) /= 0
+            and then Is_User_Leaf (Walk (Space_Id (Space), Va))
+            and then (Walk (Space_Id (Space), Va) and Flag_X) = 0
+            and then ((Walk (Space_Id (Space), Va) and Flag_W) /= 0) = (Writable /= 0)),
+     Export,
+     Convention    => C,
+     External_Name => "fb_uspace_region_map";
+
+   --  Dirección física de la página Page de la región, solo si Space está
+   --  unido a ella (si no, 0): lo que un driver necesita para programar DMA
+   --  sobre la memoria que comparte, y nada más.
+   function Region_Frame_For (Space, Region, Page : U64) return U64 with
+     Global        => (Input => State),
+     Pre           => Invariant,
+     Post          =>
+       (if Region_Frame_For'Result /= 0
+        then Valid_Space (Space)
+          and then Valid_Region (Region)
+          and then Attached_To (Tag_Of (Region), Space_Id (Space))
+          and then Page < Pages_Of (Tag_Of (Region))
+          and then Region_Frame_For'Result mod Page_Bytes = 0
+          and then Shared_By (Region_Frame_For'Result / Page_Bytes, Space_Id (Space), Space_Id (Space))),
+     Export,
+     Convention    => C,
+     External_Name => "fb_uspace_region_frame_for";
+
+   --  1 si algún espacio está unido a la región, 0 si no (o si no existe).
+   function Region_In_Use (Region : U64) return U64 with
+     Global        => (Input => State),
+     Pre           => Invariant,
+     Post          =>
+       (if Valid_Region (Region)
+        then (Region_In_Use'Result = 1)
+             = (for some S in Space_Id => Attached_To (Tag_Of (Region), S))),
+     Export,
+     Convention    => C,
+     External_Name => "fb_uspace_region_in_use";
+
+   --  Libera los marcos de una región a la que no está unido ningún espacio.
+   --  Con algún espacio unido devuelve Status_Conflict sin tocar nada.
+   function Region_Free (Region : U64) return U64 with
+     Side_Effects,
+     Global        => (In_Out => (State, Frame_Gate.State)),
+     Pre           => Invariant,
+     Post          =>
+       Invariant
+       and then
+         (if Region_Free'Result = Status_Ok
+          then Valid_Region (Region)
+            and then Pages_Of (Tag_Of (Region)) = 0),
+     Export,
+     Convention    => C,
+     External_Name => "fb_uspace_region_free";
+
+   --  Libera todos los marcos del espacio y lo deja vacío, sin unirlo ya a
+   --  ninguna región. Quien llama no debe estar usando estas tablas.
    function Destroy (Space : U64) return U64 with
      Side_Effects,
      Global        => (In_Out => (State, Frame_Gate.State)),
@@ -245,7 +446,8 @@ is
          (if Destroy'Result = Status_Ok
           then Valid_Space (Space)
             and then No_Frames_Owned (Space_Id (Space))
-            and then Device_Holder /= Space_Id (Space)),
+            and then (for all D in Device_Id => Device_Holders (D) /= Space_Id (Space))
+            and then (for all R in Region_Tag => not Attached_To (R, Space_Id (Space)))),
      Export,
      Convention    => C,
      External_Name => "fb_uspace_destroy";

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Reparte al asignador SPARK la RAM que queda libre tras la imagen del kernel.
 
 const abi = @import("abi.zig").c;

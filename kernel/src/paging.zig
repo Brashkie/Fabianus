@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Describe el mapa de memoria del kernel y activa Sv39.
 //! Las tablas las construye y las demuestra el módulo SPARK.
 
@@ -97,6 +98,9 @@ pub fn init() void {
     regions.add(first_megapage, ram_end, abi.FB_PERM_READ_WRITE, abi.FB_PAGE_2M);
 
     regions.add(abi.FB_UART0_BASE, abi.FB_UART0_BASE + abi.FB_PAGE_SIZE, abi.FB_PERM_READ_WRITE, abi.FB_PAGE_4K);
+    // El disco: el kernel solo lo lee para saber si está y lo reinicia si su
+    // driver muere.
+    regions.add(abi.FB_VIRTIO0_BASE, abi.FB_VIRTIO0_BASE + abi.FB_PAGE_SIZE, abi.FB_PERM_READ_WRITE, abi.FB_PAGE_4K);
     regions.add(abi.FB_PLIC_BASE, abi.FB_PLIC_BASE + abi.FB_PLIC_SIZE, abi.FB_PERM_READ_WRITE, abi.FB_PAGE_2M);
     // La página de las palabras msip del CLINT, para avisar a otros harts. El
     // PMP solo deja escribir sus primeros 16 bytes.

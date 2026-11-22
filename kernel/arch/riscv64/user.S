@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Programas de usuario de las autopruebas. Son datos para el kernel: se copian
  * a marcos propios del proceso y solo se ejecutan allí, en modo usuario.
@@ -625,6 +626,10 @@ END bench_pong
 BEGIN uart_driver
     .incbin "uart_driver.bin"
 END uart_driver
+
+BEGIN disk_driver
+    .incbin "disk_driver.bin"
+END disk_driver
 
 /* Sin capabilities: el dispositivo y sus interrupciones están fuera de alcance. */
 BEGIN device_denied
@@ -1642,10 +1647,522 @@ BEGIN bench_xserve
     SYS     FB_SYS_EXIT
 END bench_xserve
 
+/*
+ * Memoria compartida. Patrón de prueba: la palabra i vale 3i + 7.
+ * Los bucles usan las etiquetas 5 y 6; quien los usa no debe usarlas.
+ */
+.macro MAP_SHARED slot
+    li      a0, \slot
+    li      a1, FB_USER_SHARED_BASE
+    SYS     FB_SYS_REGION_MAP
+.endm
+
+/* Escribe el patrón en las primeras \count palabras de la región. */
+.macro WRITE_PATTERN count
+    li      t0, FB_USER_SHARED_BASE
+    li      t1, 0
+5:  bgeu    t1, \count, 6f
+    slli    t2, t1, 1
+    add     t2, t2, t1
+    addi    t2, t2, 7
+    slli    t3, t1, 3
+    add     t3, t3, t0
+    sd      t2, 0(t3)
+    addi    t1, t1, 1
+    j       5b
+6:
+.endm
+
+/* Comprueba el patrón; si una palabra no cuadra salta a \fail. */
+.macro CHECK_PATTERN count, fail
+    li      t0, FB_USER_SHARED_BASE
+    li      t1, 0
+5:  bgeu    t1, \count, 6f
+    slli    t2, t1, 1
+    add     t2, t2, t1
+    addi    t2, t2, 7
+    slli    t3, t1, 3
+    add     t3, t3, t0
+    ld      t4, 0(t3)
+    bne     t4, t2, \fail
+    addi    t1, t1, 1
+    j       5b
+6:
+.endm
+
+/* Hueco 0: región; hueco 1: endpoint con Send. Escribe a0 palabras, llama
+   con su número y espera que se lo devuelvan. Sale con 0 si todo fue bien,
+   2 si no pudo mapear. */
+BEGIN shm_writer
+    mv      s1, a0
+    MAP_SHARED 0
+    bnez    a0, 8f
+    WRITE_PATTERN s1
+    li      a0, 1
+    mv      a1, s1
+    NO_TRANSFER
+    SYS     FB_SYS_CALL
+    bnez    a0, 9f
+    bne     a1, s1, 9f
+    li      a0, 0
+    SYS     FB_SYS_EXIT
+8:  li      a0, 2
+    SYS     FB_SYS_EXIT
+9:  li      a0, 1
+    SYS     FB_SYS_EXIT
+END shm_writer
+
+/* Hueco 0: región; hueco 1: endpoint con Recv. Recibe cuántas palabras hay,
+   las comprueba y contesta con el mismo número (0 si no cuadran). Sale con
+   0 si todo fue bien, 3 si el patrón no cuadra, 2 si no pudo mapear. */
+BEGIN shm_reader
+    MAP_SHARED 0
+    bnez    a0, 8f
+    li      a0, 1
+    li      a1, FB_CAP_SLOT_NONE
+    SYS     FB_SYS_RECV
+    bnez    a0, 9f
+    mv      s1, a1
+    CHECK_PATTERN s1, 7f
+    mv      a1, s1
+    SYS     FB_SYS_REPLY
+    li      a0, 0
+    SYS     FB_SYS_EXIT
+7:  li      a1, 0
+    SYS     FB_SYS_REPLY
+    li      a0, 3
+    SYS     FB_SYS_EXIT
+8:  li      a0, 2
+    SYS     FB_SYS_EXIT
+9:  li      a0, 1
+    SYS     FB_SYS_EXIT
+END shm_reader
+
+/* Mapea la región del hueco 0 e intenta escribir en ella. */
+BEGIN shm_store
+    MAP_SHARED 0
+    bnez    a0, 8f
+    li      t0, FB_USER_SHARED_BASE
+    li      t1, 1
+    sd      t1, 0(t0)
+    SURVIVED
+8:  li      a0, 2
+    SYS     FB_SYS_EXIT
+END shm_store
+
+/* Mapea la región del hueco a0 y sale con lo que devolvió la llamada. */
+BEGIN shm_map_status
+    li      a1, FB_USER_SHARED_BASE
+    SYS     FB_SYS_REGION_MAP
+    SYS     FB_SYS_EXIT
+END shm_map_status
+
+/* Mapea la región del hueco 0 dos veces en el mismo sitio; sale con lo que
+   devolvió la segunda (2 si falló la primera). */
+BEGIN shm_map_twice
+    MAP_SHARED 0
+    bnez    a0, 8f
+    MAP_SHARED 0
+    SYS     FB_SYS_EXIT
+8:  li      a0, 2
+    SYS     FB_SYS_EXIT
+END shm_map_twice
+
+/* Hueco 0: región con Grant; hueco 1: endpoint con Send y Grant. Escribe a0
+   palabras y envía la capability de la región con su número. */
+BEGIN shm_giver
+    mv      s1, a0
+    MAP_SHARED 0
+    bnez    a0, 8f
+    WRITE_PATTERN s1
+    li      a0, 1
+    mv      a1, s1
+    li      a2, 0
+    li      a3, 0
+    li      a4, 0
+    li      a5, 0
+    SYS     FB_SYS_SEND
+    bnez    a0, 9f
+    li      a0, 0
+    SYS     FB_SYS_EXIT
+8:  li      a0, 2
+    SYS     FB_SYS_EXIT
+9:  li      a0, 1
+    SYS     FB_SYS_EXIT
+END shm_giver
+
+/* Hueco 1: endpoint con Recv. Recibe en el hueco 0 la capability de una
+   región, la mapea y comprueba el patrón. Sale con 0 si todo fue bien. */
+BEGIN shm_taker
+    li      a0, 1
+    li      a1, 0
+    SYS     FB_SYS_RECV
+    bnez    a0, 9f
+    li      t0, FB_MSG_CAP
+    bne     a5, t0, 9f
+    mv      s1, a1
+    MAP_SHARED 0
+    bnez    a0, 8f
+    CHECK_PATTERN s1, 7f
+    li      a0, 0
+    SYS     FB_SYS_EXIT
+7:  li      a0, 3
+    SYS     FB_SYS_EXIT
+8:  li      a0, 2
+    SYS     FB_SYS_EXIT
+9:  li      a0, 1
+    SYS     FB_SYS_EXIT
+END shm_taker
+
+/*
+ * Medidas de la memoria compartida. Hueco 0: región (lectura y escritura);
+ * hueco 1: endpoint con Send. a0 = vueltas. En cada vuelta escribe 4 KiB (512
+ * palabras, la i vale vuelta + i), llama con el número de vuelta y comprueba
+ * la suma que le devuelven. Al final pide parar con 0 y sale con el tiempo
+ * total en unidades del reloj (-1 si algo falla).
+ */
+BEGIN bench_shm_produce
+    mv      s1, a0
+    MAP_SHARED 0
+    bnez    a0, 9f
+    rdtime  s3
+    li      s2, 1
+1:  li      t0, FB_USER_SHARED_BASE
+    li      t1, 0
+    li      t5, 512
+2:  add     t2, s2, t1
+    slli    t3, t1, 3
+    add     t3, t3, t0
+    sd      t2, 0(t3)
+    addi    t1, t1, 1
+    bne     t1, t5, 2b
+    li      a0, 1
+    mv      a1, s2
+    NO_TRANSFER
+    SYS     FB_SYS_CALL
+    bnez    a0, 9f
+    /* 512 vuelta + (0 + 1 + ... + 511) */
+    slli    t2, s2, 9
+    li      t3, 130816
+    add     t2, t2, t3
+    bne     a1, t2, 9f
+    addi    s2, s2, 1
+    addi    s1, s1, -1
+    bnez    s1, 1b
+    rdtime  s4
+    sub     s4, s4, s3
+    li      a0, 1
+    li      a1, 0
+    NO_TRANSFER
+    SYS     FB_SYS_CALL
+    mv      a0, s4
+    SYS     FB_SYS_EXIT
+9:  li      a0, -1
+    SYS     FB_SYS_EXIT
+END bench_shm_produce
+
+/* Hueco 0: región (lectura); hueco 1: endpoint con Recv. Suma las 512
+   palabras de cada vuelta y contesta con la suma; con 0, contesta y sale. */
+BEGIN bench_shm_consume
+    MAP_SHARED 0
+    bnez    a0, 9f
+    li      a0, 1
+    li      a1, FB_CAP_SLOT_NONE
+    SYS     FB_SYS_RECV
+1:  bnez    a0, 9f
+    beqz    a1, 3f
+    li      t0, FB_USER_SHARED_BASE
+    li      t1, 0
+    li      t5, 512
+    li      t4, 0
+2:  slli    t3, t1, 3
+    add     t3, t3, t0
+    ld      t2, 0(t3)
+    add     t4, t4, t2
+    addi    t1, t1, 1
+    bne     t1, t5, 2b
+    mv      a1, t4
+    li      a0, 1
+    SYS     FB_SYS_REPLY_RECV
+    j       1b
+3:  SYS     FB_SYS_REPLY
+    li      a0, 0
+    SYS     FB_SYS_EXIT
+9:  li      a0, -1
+    SYS     FB_SYS_EXIT
+END bench_shm_consume
+
+/* Lo mismo sin memoria compartida: cada vuelta copia 4 KiB en 128 llamadas
+   de 32 bytes (a1 .. a4). Hueco 0: endpoint con Send. a0 = vueltas. */
+BEGIN bench_copy_produce
+    mv      s1, a0
+    rdtime  s3
+1:  li      s2, 128
+2:  li      a0, 0
+    mv      a1, s2
+    mv      a2, s1
+    mv      a3, s2
+    mv      a4, s1
+    NO_TRANSFER
+    SYS     FB_SYS_CALL
+    bnez    a0, 9f
+    addi    s2, s2, -1
+    bnez    s2, 2b
+    addi    s1, s1, -1
+    bnez    s1, 1b
+    rdtime  s4
+    sub     s4, s4, s3
+    li      a0, 0
+    li      a1, 0
+    NO_TRANSFER
+    SYS     FB_SYS_CALL
+    mv      a0, s4
+    SYS     FB_SYS_EXIT
+9:  li      a0, -1
+    SYS     FB_SYS_EXIT
+END bench_copy_produce
+
+/* Guarda cada mensaje en un búfer de 4 KiB de su pila y contesta. Hueco 0:
+   endpoint con Recv. Con a1 = 0, contesta y sale. */
+BEGIN bench_copy_consume
+    li      a0, 0
+    li      a1, FB_CAP_SLOT_NONE
+    SYS     FB_SYS_RECV
+    li      s2, 0
+1:  bnez    a0, 9f
+    beqz    a1, 3f
+    li      t0, -4096
+    add     t0, t0, sp
+    add     t0, t0, s2
+    sd      a1, 0(t0)
+    sd      a2, 8(t0)
+    sd      a3, 16(t0)
+    sd      a4, 24(t0)
+    addi    s2, s2, 32
+    li      t1, 4095
+    and     s2, s2, t1
+    li      a0, 0
+    SYS     FB_SYS_REPLY_RECV
+    j       1b
+3:  SYS     FB_SYS_REPLY
+    li      a0, 0
+    SYS     FB_SYS_EXIT
+9:  li      a0, -1
+    SYS     FB_SYS_EXIT
+END bench_copy_consume
+
+/* Mapea la región del hueco 0 (16 páginas) y escribe una palabra en cada
+   página. Sale con lo que tardó, en unidades del reloj (-1 si falla). */
+BEGIN bench_shm_map
+    rdtime  s3
+    MAP_SHARED 0
+    bnez    a0, 9f
+    li      t0, FB_USER_SHARED_BASE
+    li      t1, 16
+    li      t2, 4096
+1:  sd      t1, 0(t0)
+    add     t0, t0, t2
+    addi    t1, t1, -1
+    bnez    t1, 1b
+    rdtime  s4
+    sub     a0, s4, s3
+    SYS     FB_SYS_EXIT
+9:  li      a0, -1
+    SYS     FB_SYS_EXIT
+END bench_shm_map
+
+/*
+ * Disco. Llama al driver (hueco 0) con a1 = operación, a2 = sector, a3 =
+ * página; deja en a1 el estado y en a2 el segundo valor de la respuesta.
+ */
+.macro DISK op, sector, page
+    li      a0, 0
+    li      a1, \op
+    mv      a2, \sector
+    mv      a3, \page
+    li      a4, 0
+    NO_TRANSFER
+    SYS     FB_SYS_CALL
+.endm
+
+/* Hueco 0: endpoint del driver con Send; hueco 1: la región de datos que
+   comparte con él (al menos 3 páginas). Comprueba la capacidad, lee los
+   sectores 16 a 23 y comprueba el patrón de la imagen (la palabra i del sector
+   s vale s * 2^32 + i), escribe una página en los sectores 64 a 71, la vuelve
+   a leer en otra página y las compara, y prueba peticiones fuera de rango.
+   Con a0 = 1, al final pide al driver que pare. Sale con 0 si todo fue bien
+   o con el número del paso que falló. */
+BEGIN disk_check
+    mv      s9, a0
+    MAP_SHARED 1
+    li      s1, 1
+    bnez    a0, 9f
+
+    /* Capacidad: 2048 sectores. */
+    li      s1, 2
+    li      s2, 0
+    DISK    FB_DISK_OP_CAPACITY, s2, s2
+    bnez    a0, 9f
+    bnez    a1, 9f
+    li      t0, 2048
+    bne     a2, t0, 9f
+
+    /* Leer los sectores 16 a 23 en la página 0. */
+    li      s1, 3
+    li      s2, 16
+    li      s3, 0
+    DISK    FB_DISK_OP_READ, s2, s3
+    bnez    a0, 9f
+    bnez    a1, 9f
+    li      s1, 4
+    li      t0, FB_USER_SHARED_BASE
+    li      t1, 0
+    li      t5, 512
+1:  srli    t2, t1, 6
+    addi    t2, t2, 16
+    slli    t2, t2, 32
+    andi    t3, t1, 63
+    or      t2, t2, t3
+    slli    t3, t1, 3
+    add     t3, t3, t0
+    ld      t4, 0(t3)
+    bne     t4, t2, 9f
+    addi    t1, t1, 1
+    bne     t1, t5, 1b
+
+    /* Escribir en los sectores 64 a 71 la página 1. */
+    li      s1, 5
+    li      t0, FB_USER_SHARED_BASE + 4096
+    li      t1, 0
+    li      t2, 0xa5a50000
+2:  add     t3, t2, t1
+    slli    t4, t1, 3
+    add     t4, t4, t0
+    sd      t3, 0(t4)
+    addi    t1, t1, 1
+    bne     t1, t5, 2b
+    li      s2, 64
+    li      s3, 1
+    DISK    FB_DISK_OP_WRITE, s2, s3
+    bnez    a0, 9f
+    bnez    a1, 9f
+
+    /* Y leerlos en la página 2: debe quedar igual que la 1. */
+    li      s1, 6
+    li      s2, 64
+    li      s3, 2
+    DISK    FB_DISK_OP_READ, s2, s3
+    bnez    a0, 9f
+    bnez    a1, 9f
+    li      s1, 7
+    li      t0, FB_USER_SHARED_BASE + 4096
+    li      t1, FB_USER_SHARED_BASE + 8192
+    li      t2, 0
+3:  ld      t3, 0(t0)
+    ld      t4, 0(t1)
+    bne     t3, t4, 9f
+    addi    t0, t0, 8
+    addi    t1, t1, 8
+    addi    t2, t2, 1
+    bne     t2, t5, 3b
+
+    /* Una página que no cabe al final del disco y una página que la región
+       no tiene: el driver las rechaza. */
+    li      s1, 8
+    li      s2, 2044
+    li      s3, 0
+    DISK    FB_DISK_OP_READ, s2, s3
+    bnez    a0, 9f
+    li      t0, FB_DISK_ERR_REQUEST
+    bne     a1, t0, 9f
+    li      s1, 9
+    li      s2, 0
+    li      s3, 16
+    DISK    FB_DISK_OP_READ, s2, s3
+    bnez    a0, 9f
+    li      t0, FB_DISK_ERR_REQUEST
+    bne     a1, t0, 9f
+
+    beqz    s9, 4f
+    li      s1, 10
+    li      s2, 0
+    DISK    FB_DISK_OP_STOP, s2, s2
+    bnez    a0, 9f
+4:  li      a0, 0
+    SYS     FB_SYS_EXIT
+    /* Al fallar: el paso en el byte alto, y los bytes bajos de a1 y a0. */
+9:  slli    s1, s1, 56
+    andi    a1, a1, 0xff
+    slli    a1, a1, 8
+    andi    a0, a0, 0xff
+    or      a0, a0, a1
+    or      a0, a0, s1
+    SYS     FB_SYS_EXIT
+END disk_check
+
+/* Hueco 0: una región; hueco 1: un dispositivo. a0: bit 0, mapear antes el
+   dispositivo; bit 1, mapear antes la región. Sale con lo que devuelve
+   FB_SYS_DMA_ADDRESS para la página 0. */
+BEGIN dma_status
+    mv      s1, a0
+    andi    t0, s1, 1
+    beqz    t0, 1f
+    li      a0, 1
+    SYS     FB_SYS_DEVICE_MAP
+1:  andi    t0, s1, 2
+    beqz    t0, 2f
+    MAP_SHARED 0
+2:  li      a0, 0
+    li      a1, 0
+    li      a2, 1
+    SYS     FB_SYS_DMA_ADDRESS
+    SYS     FB_SYS_EXIT
+END dma_status
+
+/* Medida del disco. Hueco 0: endpoint del driver con Send; hueco 1: la región
+   de datos. a0 = vueltas | operación << 32 (FB_DISK_OP_READ o WRITE). Cada
+   vuelta mueve 4 KiB (página 0) en los sectores 8i mod 2040. Al final pide al
+   driver que pare y sale con las instrucciones que ejecutó toda la máquina
+   (instret, global con -icount; -1 si algo falla). No con el reloj: mientras
+   todos esperan al disco, QEMU lo hace saltar hasta el siguiente plazo. */
+BEGIN bench_disk
+    slli    s1, a0, 32
+    srli    s1, s1, 32
+    srli    s5, a0, 32
+    MAP_SHARED 1
+    bnez    a0, 9f
+    li      s2, 0
+    li      s3, 0
+    csrr    s6, instret
+1:  li      a0, 0
+    mv      a1, s5
+    mv      a2, s2
+    li      a3, 0
+    li      a4, 0
+    NO_TRANSFER
+    SYS     FB_SYS_CALL
+    bnez    a0, 9f
+    bnez    a1, 9f
+    addi    s2, s2, 8
+    li      t0, 2040
+    bltu    s2, t0, 2f
+    li      s2, 0
+2:  addi    s1, s1, -1
+    bnez    s1, 1b
+    csrr    s7, instret
+    sub     s7, s7, s6
+    li      s2, 0
+    DISK    FB_DISK_OP_STOP, s2, s2
+    mv      a0, s7
+    SYS     FB_SYS_EXIT
+9:  li      a0, -1
+    SYS     FB_SYS_EXIT
+END bench_disk
+
 /* Debe seguir el orden de process.Program. */
     .balign 8
     .global fb_user_program_table
 fb_user_program_table:
-    .irp name, hello,registers,spin,isolated,zerocheck,deputy,fault_csr,fault_sret,fault_load_kernel,fault_store_kernel,fault_jump_kernel,fault_store_text,fault_exec_stack,fault_stack_guard,fault_device,bench_syscall,bench_yield,no_caps,cap_rights,console_server,console_client,ping,pong,granter,grantee,ipc_sender,ipc_fifo_receiver,ipc_blocked,bench_ping,bench_pong,uart_driver,device_denied,device_rights,device_touch,device_holder,device_thief,device_exec,uart_client,uart_stopper,uart_reader,uart_loop_client,uart_loop_finish,device_irq_taker,uart_loop_on,bench_write,bench_driver_client,bench_loop_writer,bench_loop_reader,call_client,call_server,call_server_dies,call_expect_peer,send_expect_peer,call_checks,call_server_lost,call_long,call_server_pair,call_once,sched_set,sched_lower,defer_server,go_sender,reply_to_other,defer_then_die,defer_three,defer_then_serve,defer_wait,uart_call_reader,bench_call_read,bench_defer_reader,bench_defer_writer,latency_probe,call_forwarder,sleep_forever,signal_taker,bench_call,bench_serve,bench_xcall,bench_xserve,call_server_spin
+    .irp name, hello,registers,spin,isolated,zerocheck,deputy,fault_csr,fault_sret,fault_load_kernel,fault_store_kernel,fault_jump_kernel,fault_store_text,fault_exec_stack,fault_stack_guard,fault_device,bench_syscall,bench_yield,no_caps,cap_rights,console_server,console_client,ping,pong,granter,grantee,ipc_sender,ipc_fifo_receiver,ipc_blocked,bench_ping,bench_pong,uart_driver,device_denied,device_rights,device_touch,device_holder,device_thief,device_exec,uart_client,uart_stopper,uart_reader,uart_loop_client,uart_loop_finish,device_irq_taker,uart_loop_on,bench_write,bench_driver_client,bench_loop_writer,bench_loop_reader,call_client,call_server,call_server_dies,call_expect_peer,send_expect_peer,call_checks,call_server_lost,call_long,call_server_pair,call_once,sched_set,sched_lower,defer_server,go_sender,reply_to_other,defer_then_die,defer_three,defer_then_serve,defer_wait,uart_call_reader,bench_call_read,bench_defer_reader,bench_defer_writer,latency_probe,call_forwarder,sleep_forever,signal_taker,bench_call,bench_serve,bench_xcall,bench_xserve,call_server_spin,shm_writer,shm_reader,shm_store,shm_map_status,shm_map_twice,shm_giver,shm_taker,bench_shm_produce,bench_shm_consume,bench_copy_produce,bench_copy_consume,bench_shm_map,disk_driver,disk_check,dma_status,bench_disk
     .quad   \name\()_start, \name\()_end
     .endr

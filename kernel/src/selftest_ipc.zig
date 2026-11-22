@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Autopruebas de capabilities, IPC y del servicio de consola en modo usuario.
 
 const abi = @import("abi.zig").c;
@@ -91,7 +92,7 @@ fn testCapabilityGate() void {
     expectEqual(abi.fb_cap_grant(5, 0, kind, 0, send), invalid);
     expectEqual(abi.fb_cap_grant(1, 16, kind, 0, send), invalid);
     expectEqual(abi.fb_cap_grant(1, 0, 0, 0, send), invalid);
-    expectEqual(abi.fb_cap_grant(1, 0, abi.FB_CAP_SCHED + 1, 0, send), invalid);
+    expectEqual(abi.fb_cap_grant(1, 0, abi.FB_CAP_REGION + 1, 0, send), invalid);
     expectEqual(abi.fb_cap_grant(1, 0, kind, 4, send), invalid);
     expectEqual(abi.fb_cap_grant(1, 0, kind, 0, 8), invalid);
 

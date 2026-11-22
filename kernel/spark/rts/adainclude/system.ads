@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 --  Runtime Ada propio de Fabianus: solo la descripción del objetivo que exige
 --  el compilador GNAT. Es una especificación pura y no genera código.
 

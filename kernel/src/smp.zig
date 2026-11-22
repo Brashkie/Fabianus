@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Arranque de los harts secundarios.
 //!
 //! Todos los harts preparan su modo máquina en boot.S. Los secundarios esperan

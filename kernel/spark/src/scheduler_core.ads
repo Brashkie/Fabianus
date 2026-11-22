@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 --  Núcleo demostrado del planificador: prioridad estricta con presupuestos y
 --  donación del contexto de planificación.
 --
@@ -413,9 +414,15 @@ is
        and then M.Budgets = M'Old.Budgets
        and then M.Running = M'Old.Running;
 
+   --  Despertar a X no le quita un contexto a nadie: X no ha prestado el
+   --  suyo y, si usa uno prestado, ya es el último de esa cadena.
+   function Quiet (M : Model; X : Thread_Id) return Boolean is
+     (M.Lent (X) = X and then (M.Ctx (X) = X or else M.Lent (M.Ctx (X)) = X));
+
    --  Despierta a X. Si había prestado su contexto, lo recupera de todos sus
    --  usuarios. Si usaba uno prestado, vuelve a ser el último de la cadena: los
-   --  que había por debajo lo pierden.
+   --  que había por debajo lo pierden. Si no pasa ninguna de las dos cosas
+   --  (Quiet), ningún contexto ni ningún nivel cambia.
    procedure Wake (M : in out Model; X : Thread_Id) with
      Inline,
      Pre  => Valid (M) and then M.States (X) = Blocked,
@@ -435,6 +442,7 @@ is
             (if T /= X and then T /= M'Old.Ctx (X) then M.Lent (T) = M'Old.Lent (T)))
        and then
          (for all T in Thread_Id => M.Ctx (T) = M'Old.Ctx (T) or else M.Ctx (T) = T)
+       and then (if Quiet (M'Old, X) then M.Ctx = M'Old.Ctx and then M.Levels = M'Old.Levels)
        and then M.Remaining = M'Old.Remaining
        and then M.Debt = M'Old.Debt
        and then M.Budgets = M'Old.Budgets

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* El mismo trabajo que el programa `hello` de Fabianus: una línea y salir con 7. */
 #include <unistd.h>
 

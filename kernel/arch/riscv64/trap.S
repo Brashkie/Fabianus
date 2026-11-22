@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Entrada común de traps en modo supervisor: cambia a la pila de traps, guarda
  * el estado completo en un fb_trap_frame y llama al manejador en Zig.

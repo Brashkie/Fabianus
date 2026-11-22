@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Autopruebas que se ejecutan en cada arranque. Un fallo detiene el kernel.
 
 const abi = @import("abi.zig").c;
@@ -129,6 +130,8 @@ fn expectStoreFault(address: u64) void {
 /// Con la paginación aún apagada, solo el PMP puede impedir este acceso.
 fn testPmpBlocksUnlistedMemory() void {
     expectLoadFault(trap.cause_load_access_fault, pci_window_address);
+    // La segunda ranura virtio, justo después del disco, queda fuera.
+    expectLoadFault(trap.cause_load_access_fault, abi.FB_VIRTIO0_BASE + 0x1000);
     passed("PMP bloquea memoria no autorizada");
 }
 

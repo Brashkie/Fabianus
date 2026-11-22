@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Genera las constantes de Rust a partir de abi/fabianus.h, para que la ABI
 //! siga teniendo una única fuente de verdad.
 
@@ -16,6 +17,10 @@ const names = [_][]const u8{
     "FB_UART_OP_WRITE",   "FB_UART_OP_LOOPBACK", "FB_UART_OP_STOP",     "FB_UART_OP_READ",
     "FB_SYS_REPLY",       "FB_SYS_DEFER",        "FB_SYS_REPLY_TO",     "FB_MSG_CALL",
     "FB_ERR_BUSY",        "FB_ERR_INVALID",
+    "FB_SYS_REGION_MAP",  "FB_SYS_DMA_ADDRESS",  "FB_DISK_OP_STOP",     "FB_DISK_OP_READ",
+    "FB_DISK_OP_WRITE",   "FB_DISK_OP_CAPACITY", "FB_DISK_OK",          "FB_DISK_ERR_REQUEST",
+    "FB_DISK_ERR_IO",     "FB_DISK_SECTORS_PER_PAGE", "FB_DISK_QUEUE_BASE", "FB_DISK_DATA_BASE",
+    "FB_PAGE_SIZE",
 };
 
 pub fn main() !void {

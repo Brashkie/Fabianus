@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! IPC síncrono. SPARK decide quién se encuentra con quién; aquí se mueven los
 //! registros del mensaje entre los marcos de trap de los dos procesos.
 //!
@@ -67,6 +68,12 @@ var recompute_count: u64 = 0;
 /// exactamente el mayor nivel de los clientes que esperan, y con él el
 /// servidor cumple la regla. El kernel no guarda ninguna copia: si un hilo
 /// hereda se lee del modelo.
+///
+/// Entre harts, llamar y contestar van fusionados con la herencia
+/// (Inherit_Gate.Call_Wake y Reply_Wake): despertar al otro extremo y
+/// recalcular el suelo es una sola operación SPARK, con solo los cerrojos de
+/// los dos harts, y está demostrado que la regla se conserva en todos los
+/// hilos.
 pub fn updateBoost(server: u64) void {
     if (server == 0 or server >= thread.max_threads) return;
     boost_count += 1;
@@ -91,14 +98,7 @@ pub fn recomputations() u64 {
 
 /// Si el servidor tiene respuestas aplazadas, pasa a usar el contexto del cliente
 /// aplazado más prioritario. SPARK solo deja cambiar a uno de más prioridad, así
-/// que basta con ofrecerle todos: se queda con el mayor. Si heredaba un suelo,
-/// se recalcula.
-pub fn readopt(server: u64) void {
-    if (server == 0 or server >= thread.max_threads) return;
-    if (thread.hasFloorHere(server)) updateBoost(server);
-    readoptContexts(server);
-}
-
+/// que basta con ofrecerle todos: se queda con el mayor.
 fn readoptContexts(server: u64) void {
     if (!deferring[server]) return;
     var pending = false;
@@ -304,10 +304,35 @@ pub fn call(frame: *abi.fb_trap_frame) u64 {
     const server = takeWaiting(peer);
     deliver(frame, id, server, peer);
     server.regs[a5] = abi.FB_MSG_CALL;
-    // De otro hart o con suelo propio: el servidor hereda antes de despertar,
-    // así el aviso a su hart ya cuenta con ello.
-    if (needsFloor(id, peer)) updateBoost(peer);
+    if (thread.homeOf(peer) != thread.homeOf(id)) {
+        // Otro hart, sin cesión directa ni préstamo: llamar y heredar. El
+        // servidor hereda y despierta en una sola pasada, así el aviso a su
+        // hart ya cuenta con lo heredado.
+        boost_count += 1;
+        thread.wakeInheriting(peer);
+        return wait(frame, id);
+    }
+    // Con suelo propio, el contexto prestado no lleva toda la urgencia.
+    if (thread.hasFloorHere(id)) updateBoost(peer);
     return waitSwitchingTo(frame, id, peer, true);
+}
+
+/// `server` acaba de contestar a `caller`: lo despierta y deja al día la
+/// herencia de `server`. Si el cliente es de otro hart y el servidor heredaba,
+/// responder y heredar van en una sola pasada.
+fn release(server: u64, caller: u64) void {
+    if (thread.hasFloorHere(server)) {
+        if (thread.homeOf(caller) != thread.homeOf(server)) {
+            boost_count += 1;
+            thread.replyWaking(server, caller, false);
+        } else {
+            thread.unblock(caller);
+            updateBoost(server);
+        }
+    } else {
+        thread.unblock(caller);
+    }
+    readoptContexts(server);
 }
 
 /// Copia la respuesta al cliente, que sigue bloqueado hasta que alguien lo despierte.
@@ -326,8 +351,7 @@ pub fn reply(frame: *abi.fb_trap_frame) u64 {
     if (caller == abi.FB_IPC_INVALID) return abi.FB_ERR_INVALID;
 
     answer(caller, frame);
-    thread.unblock(caller);
-    readopt(thread.currentId());
+    release(thread.currentId(), caller);
     return 0;
 }
 
@@ -349,8 +373,7 @@ pub fn replyTo(frame: *abi.fb_trap_frame) u64 {
     const caller = frame.regs[a0];
     if (abi.fb_ipc_reply_held(thread.currentId(), caller) == abi.FB_IPC_INVALID) return abi.FB_ERR_INVALID;
     answer(caller, frame);
-    thread.unblock(caller);
-    readopt(thread.currentId());
+    release(thread.currentId(), caller);
     return 0;
 }
 
@@ -370,20 +393,22 @@ pub fn replyRecv(frame: *abi.fb_trap_frame) u64 {
         // Con respuestas aplazadas, antes de esperar hay que volver a tomar un
         // contexto: no se cede la CPU directamente.
         if (answered and !deferring[id]) {
-            if (thread.hasFloorHere(id)) updateBoost(id);
+            if (thread.hasFloorHere(id)) {
+                if (thread.homeOf(caller) != thread.homeOf(id)) {
+                    // Otro hart: responder y heredar, y esperar.
+                    boost_count += 1;
+                    thread.replyWaking(id, caller, true);
+                    return wait(frame, id);
+                }
+                updateBoost(id);
+            }
             return waitSwitchingTo(frame, id, caller, false);
         }
-        if (answered) {
-            thread.unblock(caller);
-            readopt(id);
-        }
+        if (answered) release(id, caller);
         return wait(frame, id);
     }
 
-    if (answered) {
-        thread.unblock(caller);
-        readopt(id);
-    }
+    if (answered) release(id, caller);
     if (peer == abi.FB_IPC_INVALID) return abi.FB_ERR_INVALID;
     if (peer == abi.FB_IPC_SIGNAL) {
         deliverSignal(frame);

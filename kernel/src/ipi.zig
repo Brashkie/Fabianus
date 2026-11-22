@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Avisos entre harts (IPI).
 //!
 //! Para avisar a un hart, el kernel escribe 1 en su palabra msip del CLINT: es

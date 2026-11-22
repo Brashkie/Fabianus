@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Salida mínima del kernel por la UART 16550, en modo de sondeo: el arranque,
 //! las autopruebas y los pánicos. El driver completo es un proceso de usuario.
 

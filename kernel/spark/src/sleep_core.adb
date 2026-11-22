@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 package body Sleep_Core with
   SPARK_Mode,
   Refined_State => (State => (Sleeping, Wake_At))

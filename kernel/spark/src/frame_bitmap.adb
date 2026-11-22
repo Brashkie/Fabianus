@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 package body Frame_Bitmap with
   SPARK_Mode
 is

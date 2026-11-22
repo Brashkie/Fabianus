@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Primer código de Fabianus. Con `-bios none`, QEMU entra aquí en modo máquina
  * y deja en a0 el identificador del hart. Este archivo prepara el procesador
@@ -12,6 +13,8 @@
 #define PMP_NAPOT(base, size) (((base) | ((size) / 2 - 1)) >> 2)
 #define PMP_DEVICE_SIZE    0x1000
 /* Entrada 0: RAM con RWX. Entradas 1 a 4: dispositivos con RW. Todas NAPOT.
+   La 1 son las dos primeras páginas de dispositivos: la UART y la primera
+   ranura virtio (el disco); las demás ranuras virtio quedan fuera.
    La 4 son solo las palabras msip del CLINT: el supervisor puede avisar a
    otros harts, pero no tocar mtimecmp. */
 #define PMP_CONFIG         0x1b1b1b1b1f
@@ -99,7 +102,7 @@ machine_setup:
     /* El modo supervisor solo puede tocar la RAM y los tres dispositivos. */
     li      t0, PMP_NAPOT(FB_RAM_BASE, FB_RAM_SIZE)
     csrw    pmpaddr0, t0
-    li      t0, PMP_NAPOT(FB_UART0_BASE, PMP_DEVICE_SIZE)
+    li      t0, PMP_NAPOT(FB_UART0_BASE, 2 * PMP_DEVICE_SIZE)
     csrw    pmpaddr1, t0
     li      t0, PMP_NAPOT(FB_TEST_FINISHER_BASE, PMP_DEVICE_SIZE)
     csrw    pmpaddr2, t0

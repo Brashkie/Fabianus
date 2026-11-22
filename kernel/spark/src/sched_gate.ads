@@ -1,3 +1,4 @@
+--  SPDX-License-Identifier: GPL-3.0-or-later
 --  Frontera del planificador con el resto de lenguajes. Cada identificador y
 --  cada cambio de estado se comprueba aquí en tiempo de ejecución.
 --
@@ -109,8 +110,12 @@ is
 
    --  El hart al que pertenece un hilo, o None.
    function Home_Of (Thread : U64) return U64 with
+     Inline,
      Global        => (Input => State),
-     Post          => Home_Of'Result = None or else Home_Of'Result <= Last_Hart,
+     Post          =>
+       (if Thread <= Last_Id
+        then Home_Of'Result = U64 (Home_View (Scheduler_Core.Thread_Id (Thread)))
+        else Home_Of'Result = None),
      Export,
      Convention    => C,
      External_Name => "fb_sched_home";
@@ -394,6 +399,9 @@ is
                  and then New_M.Remaining = Old_M.Remaining
                  and then New_M.Budgets = Old_M.Budgets
                  and then New_M.Debt = Old_M.Debt
+                 --  Si no le quita un contexto a nadie, ningún nivel cambia.
+                 and then
+                   (if Scheduler_Core.Quiet (Old_M, T) then New_M.Levels = Old_M.Levels)
                  and then
                    (if Wake_Remote'Result = Status_Ok
                     then Scheduler_Core.Top_Now (New_M, New_M.Running)
@@ -414,6 +422,81 @@ is
      Export,
      Convention    => C,
      External_Name => "fb_sched_wake_remote";
+
+   --  Boost y Wake_Remote en una sola operación sobre el modelo del hilo: el
+   --  hilo, bloqueado, pasa a tener Level como suelo (None lo quita) y
+   --  despierta. Mismo aviso que Wake_Remote. Solo si despertarlo no le quita
+   --  un contexto a nadie (Quiet; si no, Status_Wrong_State sin tocar nada):
+   --  así el nivel de los demás hilos no cambia.
+   function Wake_Boost (Thread, Level : U64) return U64 with
+     Side_Effects,
+     Global        => (In_Out => State),
+     Pre           => Invariant,
+     Post          =>
+       Invariant
+       and then Shared_View = Shared_View'Old
+       and then Is_Started = Is_Started'Old
+       and then
+         (if Wake_Boost'Result = Status_Ok or else Wake_Boost'Result >= Notify_Base
+          then Is_Started
+            and then Thread in 1 .. Last_Id
+            and then (Level = None or else Level < U64 (Scheduler_Core.Levels))
+            and then
+              (declare
+                 T     : constant Scheduler_Core.Thread_Id := Scheduler_Core.Thread_Id (Thread);
+                 H     : constant Hart_Id := Home_View (T);
+                 New_M : constant Scheduler_Core.Model := Models_View (H);
+                 Old_M : constant Scheduler_Core.Model := Models_View'Old (H);
+                 Floor : constant Scheduler_Core.Priority :=
+                   (if Level = None then 0 else Scheduler_Core.Priority (Level));
+               begin
+                 Only_Hart (Models_View'Old, Models_View, H)
+                 and then Old_M.States (T) = Scheduler_Core.Blocked
+                 and then Scheduler_Core.Quiet (Old_M, T)
+                 and then New_M.States = (Old_M.States with delta T => Scheduler_Core.Ready)
+                 and then New_M.Lent (T) = T
+                 and then New_M.Floors = (Old_M.Floors with delta T => Floor)
+                 and then New_M.Remaining = Old_M.Remaining
+                 and then New_M.Budgets = Old_M.Budgets
+                 and then New_M.Debt = Old_M.Debt
+                 and then
+                   Scheduler_Core.Level_Of (New_M, T)
+                   = Scheduler_Core.Priority'Max (Old_M.Priorities (Old_M.Ctx (T)), Floor)
+                 --  Con el mismo suelo, tampoco cambia el suyo.
+                 and then
+                   (if Floor = Old_M.Floors (T)
+                    then Scheduler_Core.Level_Of (New_M, T) = Scheduler_Core.Level_Of (Old_M, T))
+                 and then
+                   (for all X in Scheduler_Core.Thread_Id =>
+                      (if X /= T
+                       then Scheduler_Core.Level_Of (New_M, X)
+                            = Scheduler_Core.Level_Of (Old_M, X)))
+                 and then
+                   (if Wake_Boost'Result = Status_Ok
+                    then Scheduler_Core.Top_Now (New_M, New_M.Running)
+                      and then New_M.Running /= 0
+                    else Wake_Boost'Result = Notify_Base + U64 (H)
+                      and then (not Scheduler_Core.Top_Now (New_M, New_M.Running)
+                                or else New_M.Running = 0)))
+          else Models_View = Models_View'Old
+            and then Wake_Boost'Result in Status_Invalid | Status_Wrong_State)
+       --  Y no falla sin motivo: un hilo bloqueado que no ha prestado nada
+       --  siempre despierta.
+       and then
+         (if Is_Started
+            and then Thread in 1 .. Last_Id
+            and then (Level = None or else Level < U64 (Scheduler_Core.Levels))
+            and then
+              Models_View'Old (Home_View (Scheduler_Core.Thread_Id (Thread))).States
+                (Scheduler_Core.Thread_Id (Thread)) = Scheduler_Core.Blocked
+            and then
+              Scheduler_Core.Quiet
+                (Models_View'Old (Home_View (Scheduler_Core.Thread_Id (Thread))),
+                 Scheduler_Core.Thread_Id (Thread))
+          then Wake_Boost'Result = Status_Ok or else Wake_Boost'Result >= Notify_Base),
+     Export,
+     Convention    => C,
+     External_Name => "fb_sched_wake_boost";
 
    --  El hilo, que acaba de despertar, pasa a ser el siguiente en turno de su
    --  nivel: si nadie de más prioridad está listo, la próxima decisión es él.
@@ -583,6 +666,7 @@ is
    --  Suelo de un hilo en el modelo de su hart, o None si no existe. Nunca
    --  supera la prioridad con que corre.
    function Floor_Of (Thread : U64) return U64 with
+     Inline,
      Global        => (Input => State),
      Pre           => Invariant,
      Post          =>
@@ -617,6 +701,7 @@ is
    --  Prioridad efectiva con que corre un hilo (la de su contexto, y al menos
    --  su suelo) en el modelo de su hart. None si no existe.
    function Priority_Of (Thread : U64) return U64 with
+     Inline,
      Global        => (Input => State),
      Post          =>
        (if Thread in 1 .. Last_Id

@@ -6,13 +6,426 @@ foundation, verification (what is proved and what is only tested) and
 experimental evidence.
 
 - **Languages:** Zig (core), Ada/SPARK (proved parts), assembly, Rust (UART
-  driver as a user process), C (common ABI and Linux comparison). D and VHDL
-  are decided but not used yet.
+  and disk drivers as user processes), C (common ABI and Linux comparison).
+  D and VHDL are decided but not used yet.
+- **License:** GPL-3.0-or-later. Every source file carries the line
+  `SPDX-License-Identifier: GPL-3.0-or-later`.
 - **Instructions per operation:** measured in QEMU with `-icount`.
 - **"Proved":** checked by GNATprove over the whole SPARK code base, as a
   mandatory gate before compiling.
 
 ---
+
+## Milestone 34 — A disk driver in Rust, with DMA into shared memory
+
+- **Goal:** the first storage device. A virtio-blk disk driven by a user
+  process written in Rust, which moves data by DMA straight into memory it
+  shares with its clients: no copies through the kernel.
+- **Devices in SPARK (`User_Space`):**
+  - "The device" (the UART page) becomes a set of device pages, each held by
+    at most one space: the UART and the first virtio slot (the disk).
+    `Map_Device` takes the device, and the isolation theorem
+    (`Lemma_Isolation`, `Lemma_Private`) covers both.
+  - `Destroy` releases every device of the space.
+  - **`Region_Frame_For`:** the physical address of a region page, only for a
+    space joined to that region. It is all a driver needs to program DMA on
+    the memory it shares, and the kernel never gives it any other address.
+  - 664 checks in `User_Space` (623 in milestone 33).
+- **Kernel:**
+  - `device.zig` handles several devices, each with its interrupt line and
+    endpoint. When the owner of the disk dies, the kernel resets the disk
+    (virtio Status = 0) **before** freeing its memory: a DMA still in flight
+    can never land on frames that already belong to someone else.
+  - The PMP entry of the UART now covers 8 KiB (UART and the first virtio
+    slot); the next slot stays outside, and a test checks it.
+  - New system call `FB_SYS_DMA_ADDRESS`: it needs the disk capability with
+    Send, holding the disk's registers, and being joined to the region.
+- **Driver (`drivers/disk/main.rs`, Rust, `no_std`, no global data):**
+  - modern virtio-mmio (version 2): feature negotiation (only `VERSION_1`),
+    one queue of 8 descriptors in a private region page;
+  - every request is three descriptors: header, the client's page and the
+    status byte. The disk reads or writes 4 KiB directly in the region it
+    shares with the client;
+  - protocol (`FB_DISK_*`): the client calls with the operation, the first
+    sector and a page of the shared region; the driver checks the range and
+    the page, defers the call, waits for the disk's interrupt and replies.
+    Deferring is required: a server that owes a reply cannot receive
+    anything else (proved in `Ipc_Core`), and the interrupt arrives as a
+    message.
+- **Test disk:** `tools/mkdisk.zig` generates a 1 MiB image where word i of
+  sector s is s·2³² + i, so any read can be checked without a copy. QEMU
+  opens it with `snapshot=on`: writes are lost on power-off and every boot
+  sees the same disk. `zig build run` adds it.
+- **Measurements** (`-icount`, 4 harts), instructions of the whole machine
+  per 4 KiB request (client, kernel and driver):
+
+  | Request | Driver on the same hart |
+  |---|---|
+  | Read 4 KiB | 5228 (median; 5191 to 5653) |
+  | Write 4 KiB | 5204 (median; 5196 to 5255) |
+
+  - **Latency cannot be measured reliably in QEMU:** while every hart waits
+    for the disk, the virtual clock jumps from deadline to deadline, and the
+    disk's real time on the host decides how many jumps there are. Measured
+    by the clock, a read went from 20.7 to 66.6 µs between runs.
+  - **With the driver on another hart** the count also includes the timer
+    work done during those jumps: 160,000 to 440,000 instructions per
+    request, depending on the run. Under a full trace, where QEMU is so slow
+    that the disk answers "at once", the same request costs 6,438.
+  - **Against Linux:** the Debian kernel loads `virtio_mmio` and
+    `virtio_blk` (both modules in Debian) and reads `/dev/vda` with
+    `O_DIRECT`, but in this QEMU `instret` read from user mode does not
+    advance, so there is no comparable figure. The measurement program
+    detects it and says so.
+- **New tests** (3):
+  - a client reads and writes the disk through the Rust driver on another
+    hart: it checks the image pattern, writes a page and reads it back into
+    another, and the driver rejects a page that does not fit at the end of
+    the disk and one the region does not have. When the driver stops, the
+    disk is reset, the regions are freed and every frame comes back;
+  - if the driver dies with the disk running, the kernel resets the disk
+    before freeing its memory;
+  - only whoever holds the disk's registers (Send) and has joined the region
+    learns a physical address: not without the capability, not with the
+    UART's, not with Recv only, not without mapping the registers, not
+    without joining.
+- **Found on the way:** the disk tests waited with interrupts disabled, like
+  most kernel tests. With driver and client blocked, nobody on hart 0 took
+  the disk's interrupt. They now wait with interrupts enabled, as the UART
+  tests do.
+- **Verification:**
+  - full proof from scratch with nothing pending: 2240 checks (2199 in
+    milestone 33);
+  - 137 self-tests in 8 of 8 boots in a row with 1 hart and with 4, in 2 of
+    2 with 4 harts under `-icount`, and in Debug with 1 and with 4 harts;
+  - stress with 4 QEMU instances at once: 128 of 128 with 1 hart and 192 of
+    192 with 4 harts;
+  - the other measures are unchanged from milestone 33 (call and reply on 1
+    hart 1956, across harts 4841 ns).
+- **Mutations:**
+  - SPARK: 6 of 6 rejected (mapping a device that already has an owner, two
+    devices on the same page, `Translate` excluding only the UART,
+    `Destroy` without releasing devices, `Region_Frame_For` without being
+    joined, and without checking the frame's range). The first round left
+    one alive: `Is_Device_Ppn` was a separate copy of the device pages, and
+    changing it moved the specification together with the code. It is now
+    defined from the device table, and the equivalent mutation of
+    `Translate` is rejected.
+  - Runtime: 9 of 9 (resetting the disk on release, the three DMA checks,
+    no interrupt line enabled, the driver not letting the disk write when
+    reading, not deferring, not checking the range, and the PMP without the
+    disk's slot).
+  - Earlier milestones: the same survivors as in milestone 33 (milestone 33:
+    9 of 10; 32: 21 of 23; 27: 7 of 9; 22 to 26: the usual ones, and two do
+    not compile).
+- **Limits:**
+  - **No IOMMU:** a DMA driver could tell the disk to write anywhere. The
+    kernel only hands it the addresses of its own regions, but it cannot
+    stop it from making them up: the disk driver is trusted for that, as in
+    any system without an IOMMU.
+  - One request at a time and one queue: no request pipelining yet.
+  - If the driver dies, the kernel leaves the disk safe, but nobody starts a
+    new driver.
+  - Only QEMU's virtio-blk, in the first slot. Latency is not measurable in
+    this setup.
+- **Licensing:** the project is now explicitly GPL-3.0-or-later. Every
+  source file starts with an SPDX line, `alire.toml` declares the license,
+  and the README states it in full. The proof (2240 checks) and the 137
+  self-tests with 1 and 4 harts were rerun after the change.
+
+## Milestone 33 — Shared memory between processes
+
+- **Goal:** the first step towards a usable system. Disk and network drivers
+  need to hand over whole buffers, and until now two processes could only
+  exchange 32 bytes per message. The proved isolation between address spaces
+  had to stay a theorem, now with an exception that is itself proved.
+- **Design:**
+  - A **region** is a list of frames whose owner is the region, not a space.
+    The owner of a frame is now nobody, a space (1 to 4) or a region (5 to
+    8), and the per-owner frame lists proved in milestone 18 cover regions
+    with the same definition (`Lists_Ok` over every owner).
+  - A space can only map a region's pages after **joining** it
+    (`Region_Attach`), and it only leaves when it is destroyed. So a page is
+    never taken away from a live process, and no other hart ever has to be
+    told to forget a translation.
+  - Who may join is decided by a **capability** of the new kind `Region`,
+    passed over IPC like any other (with Grant). Recv allows mapping it for
+    reading; Send, also for writing. Never for execution.
+  - **Lifetime:** the kernel creates a region with its pages zeroed and holds
+    it until it grants it. From then on it lives while some space is joined
+    to it or some capability names it, and the kernel frees it after the
+    last process that reached it is destroyed.
+- **SPARK, `User_Space`:**
+  - The invariant now says that every leaf points to a frame of its own
+    space, to a frame of a region the space has joined, or to the device if
+    it holds it. A region without frames does not exist and nobody is joined
+    to it (`Regions_Ok`).
+  - **`Lemma_Isolation`, generalised:** two distinct spaces only reach the
+    same frame if it belongs to a region both have joined (`Shared_By`).
+  - **`Lemma_Private`:** a frame of a space's own is never reachable from
+    another space.
+  - New operations, proved: `Region_Create` (all or nothing: if a frame is
+    missing it keeps none), `Region_Frame`, `Region_Attach`, `Region_Map`
+    (read-only or read-write leaves, never executable, and only for a joined
+    space), `Region_In_Use` and `Region_Free` (only with no space joined).
+    `Destroy` also leaves every region.
+  - The device and the region links travel together in the ownership lemmas
+    (`Access_Rights`), with two new frame lemmas: more links never break
+    what a space may use, and other spaces' links do not affect it.
+- **SPARK, `Cap_Core`:** the kind `Region` and `Refers` (whether some
+  capability names an object), which the kernel needs before freeing a
+  region. The theorem that authority never grows (`Covered`) is unchanged
+  and still proved.
+- **Kernel:**
+  - `region.zig`: creating (zeroing the pages), the system call
+    `FB_SYS_REGION_MAP` (maps every page of the region from an address) and
+    freeing what nobody reaches.
+  - **Bug fixed, older than this milestone:** an order to die was only
+    honoured on an interrupt from user mode or when waking from a wait. A
+    process told to die before entering an endless wait (sleeping forever,
+    receiving with no sender) never died. A new test reproduced it every
+    time. Now every system call checks the order first, and `requestKill`
+    takes the global lock, so either the call sees it or the process is
+    already waiting and the wait is cancelled.
+  - The order is kept in a free word just above each thread's trap frame,
+    so checking it costs one load and one branch. The first version, reading
+    it from the kill table through the current thread, added 11
+    instructions to every system call.
+- **Measurements** (`-icount`, 4 harts; Linux 6.12, the official Debian 13
+  kernel, on the same QEMU):
+
+  | Measure | Fabianus | Linux |
+  |---|---|---|
+  | 4 KiB to a process on another hart and a sum back, shared memory | 11.1 µs | 29.7 µs (futex) |
+  | The same, copying | 623.6 µs (128 calls of 32 bytes) | 32.6 µs (pipe) |
+  | Create a 64 KiB region, map it and write its 16 pages | 13.8 + 4.0 = 17.8 µs | 92.5 µs (`mmap` + faults) |
+
+  Medians of 5 runs.
+  - With shared memory, passing 4 KiB costs 2.7 times less than in Linux
+    and 56 times less than copying them over Fabianus's own IPC.
+  - Copying is where Fabianus loses, by far: its IPC carries 32 bytes per
+    message and has no bulk copy. Shared memory is the intended way to move
+    data.
+  - In Fabianus, creating a region (reserving and zeroing 16 pages, in the
+    kernel) is measured apart from mapping it; in Linux both happen inside
+    the page faults of the first write.
+  - **Cost elsewhere** (1 hart, instructions): system call 208 → 212, call
+    and reply 1947 → 1956, IPC 3463 → 3479; with 4 harts, same hart 1980 →
+    1989 ns and across harts 4857 → 4909 ns. It is the kill-order check on
+    every system call. The IPC measure without the measuring thread reads
+    2973 in the full benchmark (2880 before), but run on its own it goes
+    from 2857 to 2873: the rest comes from the state earlier measures leave
+    behind (as in milestone 30).
+- **New tests** (7):
+  - two processes on different harts share a two-page region: the reader
+    sees exactly what the writer wrote, and when both end the region is freed
+    and every frame comes back;
+  - with a capability without Send the region is mapped read-only, and
+    writing to it is a page fault; with Send the same program writes;
+  - mapping needs a region capability with Recv (not an empty slot, not
+    another kind, not only Send) and never overwrites a mapped page;
+  - a region capability travels over IPC, and the receiver maps the same
+    memory and sees what the sender wrote;
+  - a region lives while some capability names it, even if nobody has it
+    mapped, and the kernel holds a new region until it grants it, even if
+    another process dies meanwhile;
+  - a new region starts zeroed even if its frames held data;
+  - a process told to die before blocking dies anyway.
+- **Verification:**
+  - full proof from scratch with nothing pending: 2199 checks (1976 in
+    milestone 32); `User_Space` alone has 623;
+  - 134 self-tests in 8 of 8 boots in a row with 1 hart and with 4, in 2 of
+    2 with 4 harts under `-icount`, and in Debug with 1 and with 4 harts;
+  - stress with 4 QEMU instances at once: 128 of 128 with 1 hart and 192 of
+    192 with 4 harts.
+- **Mutations:**
+  - SPARK: 10 of 10 rejected (mapping without joining, freeing with spaces
+    joined, destroying without leaving, joining a region that does not
+    exist, ignoring the link in `Uses`, creating with a frame that already
+    had an owner, always writable, executable, freeing without returning the
+    frames, `Refers` without looking at the object).
+  - Runtime: 9 of 10. The survivor is "kill without the global lock": it
+    closes a window of a few instructions between the check on entering a
+    call and blocking, on another hart, which no test hits deterministically
+    (like the milestone 27 races). The argument that the lock closes it is
+    by hand.
+  - Milestone 32: 21 of 23, the same two latency survivors. Milestone 27: 7
+    of 9 (the two races only Debug detects). Milestones 22 to 26: the usual
+    survivors; two do not compile.
+- **Limits:**
+  - A space cannot unmap a region while it lives; it leaves it when it is
+    destroyed. Unmapping from a live process will need telling other harts
+    to forget the translation (TLB shootdown).
+  - Only the kernel creates regions. A process cannot ask for one yet:
+    creating authority from a system call needs extending the `Covered`
+    theorem to new objects.
+  - At most 4 regions of 16 pages (64 KiB) each, like the other fixed
+    limits of the system (4 spaces, 8 threads).
+  - Zeroing a new region is kernel code, tested but not proved.
+  - That joining requires the capability is checked by `region.zig`, not by
+    SPARK: `User_Space` proves what joining allows, and `Cap_Core` who holds
+    the capability.
+  - The worst case of the cross-hart inversion is still the 439 µs of
+    milestone 32.
+  - Measurements are from QEMU with `-icount`, not real hardware.
+
+## Milestone 32 — Call and inherit in one pass
+
+- **Goal:** recover the cross-hart cost that milestone 31 added (+6.5%)
+  without losing what it proved, and prove the inheritance rule at the moment
+  of the call and of the reply, which until now only Debug watched.
+- **Where the cost was** (per-function profile of the cross-hart round trip,
+  5218 instructions in milestone 31): about 1700 instructions went into
+  inheritance and into waking the other side:
+  - the floor was recomputed twice per round trip, each time with the locks
+    of all 4 harts;
+  - the other side was woken separately, with one more lock;
+  - when the server's hart was idle, the call sent it two notifications.
+- **SPARK, `Inherit_Gate`:**
+  - **`Call_Wake`** (call and inherit): the server, blocked waiting for
+    requests, has just received a call. In one pass its floor becomes exactly
+    the highest level among its clients (`Is_Needed`) and it wakes in its
+    hart's model. It proves:
+    - the rule for the server (`Inherits`);
+    - that the rule is **preserved for every other thread** (`Kept`: whoever
+      satisfied it before still does);
+    - that only the server's hart model changes, and which hart to notify;
+    - that it does not fail without a reason.
+  - **`Reply_Wake`** (reply and inherit): the server has just answered a
+    client on another hart. In one pass the client wakes and the server's
+    floor is recomputed from the clients it still has. Same guarantees,
+    including `Kept`.
+  - **Only the locks that are needed:** both operations receive the set of
+    hart locks held (`Held`) and check by themselves that it covers the
+    server's hart, every client's hart and the hart of the thread they wake
+    (`Covers`). If it does not, they change nothing and return
+    `Status_Unheld`; the kernel retries with all harts. This is the case of a
+    deferred client living on a third hart.
+  - `Lemma_Keep_All`: if only the server's level changes and the server waits
+    for nobody, nobody else stops satisfying the rule.
+  - `Scan`: the client loop shared by `Refresh`, `Call_Wake` and
+    `Reply_Wake`.
+- **SPARK, other packages:**
+  - `Scheduler_Core.Quiet`: waking a thread takes no context away from
+    anyone (it has not lent its own and, if it uses a borrowed one, it is
+    already the last in that chain). `Wake` proves that in that case no
+    context and no level changes.
+  - `Sched_Gate.Wake_Boost`: sets the floor and wakes in a single operation
+    on the model. It only acts if `Quiet` holds (otherwise
+    `Status_Wrong_State` with nothing changed), so it proves that no other
+    thread's level changes.
+  - `Sched_Gate.Wake_Remote` proves that, if `Quiet`, no level changes.
+  - `Sched_Gate.Home_Of` states which hart it returns.
+  - `Ipc_Core.Waits_For`, `Sched_Gate.Home_Of`, `Priority_Of` and `Floor_Of`
+    are inlined.
+- **Kernel:**
+  - `thread.wakeInheriting` and `thread.replyWaking` take only the locks of
+    the two harts involved and retry with all of them if SPARK asks for it
+    (`thread.unheldRetries` counts the retries).
+  - `ipc.call` across harts uses `Call_Wake` and waits; `reply`, `reply_to`
+    and `reply_recv` go through `ipc.release`, which uses `Reply_Wake` when
+    the client is on another hart and the server inherits.
+  - When the server blocks right after replying (`reply_recv`), it does not
+    check whether its own hart should yield: it is about to choose anyway.
+  - The same-hart paths are unchanged.
+- **Measurements** (`-icount`):
+
+  | Measure | Milestone 31 | Milestone 32 |
+  |---|---|---|
+  | Across harts, round trip | 5221 ns | 4857 ns (−7.0%) |
+  | Across harts, waking the other side | 2633 ns | 2298 ns |
+  | Same hart (4 harts), round trip | 1980 ns | 1980 ns |
+  | Call and reply, 1 hart | 1947 | 1947 |
+  | Call with one hop, 1 hart | 4446 | 4446 |
+  | IPC / context switch / `yield`, 1 hart | 3463 / 413 / 583 | 3463 / 413 / 583 |
+
+  - The cross-hart round trip is now below milestone 30 (4902 ns), before
+    the rule was proved.
+  - **Tried and discarded:** a first version returned the client set from
+    `Ipc_Core` as an array (`Clients_Of`) and gained only 1.3%: building and
+    unpacking the array cost more than the calls it replaced. Inlining
+    `Waits_For` was cheaper.
+  - Cross-hart inversion (the server starts running): minimum 9264 → 8529
+    ns, median 10299 → 9452 ns. The worst of the 1280 calls went from 253 to
+    439 µs, the same in the three runs (see the limits).
+  - Stale inheritance: 2.7 µs median, unchanged.
+- **New tests:**
+  - **Retrying with all locks** (3 or more harts):
+    - a server on hart 1 defers an urgent client from hart 2 and then
+      receives a call from hart 0. The two locks are not enough, so the call
+      is retried with all harts and the server keeps the deferred client's
+      urgency;
+    - the same when replying: the server answers a client from hart 0 while
+      a deferred one from hart 2 remains, and drops to its urgency;
+    - without deferred clients on other harts, calling and replying never
+      ask for all locks (checked in two existing tests).
+  - **Paths that lost coverage** (2 or more harts). Until milestone 31 they
+    were only exercised indirectly through the cross-hart ones; mutation
+    testing showed the gaps once those moved to `Call_Wake` and
+    `Reply_Wake`:
+    - a server that inherits a floor through a forwarder on its own hart
+      (the forwarder inherits it from a client on another hart) drops it
+      when it replies, both with `reply` and with `reply_recv`;
+    - a server that takes from its queue a client of its own hart that
+      inherits gets that client's floor;
+    - the cross-hart call test adds a round with the client at the lowest
+      priority: the server inherits nothing and replies through the path
+      without inheritance.
+- **Removed:** `ipc.readopt`, replaced by `ipc.release`.
+- **Race fixed in a milestone 24 test:** stress found one failure ("invalid
+  scheduling parameters") in `testLowOnIdleHart`. The test created a thread
+  that spins for 30 ms of real time and then set its priority. The most
+  likely cause: with the host saturated, the creating hart took longer than
+  that, the thread had already finished, and SPARK refused to set parameters
+  on a free slot. It is not confirmed (the panic does not dump the state).
+  The thread now starts counting only once its priority is set.
+- **Verification:**
+  - full proof from scratch with nothing pending: 1976 checks (1850 in
+    milestone 31);
+  - 127 self-tests in 8 of 8 boots in a row with 1 hart and with 4, in 2 of
+    2 with 4 harts under `-icount`, and in Debug with 1 and with 4 harts;
+  - stress with 4 QEMU instances at once:
+    - with 1 hart, 128 of 128, twice;
+    - with 4 harts, 765 of 768 over four runs. One failure was the milestone
+      24 test race described above. The other two are the cross-hart
+      inheritance test at about 100 ms, the pattern seen since milestone 26;
+    - in an alternating comparison on the same host, milestone 31's binary
+      and milestone 32's both passed 192 of 192. Counting every run, that
+      failure appears about once in 384 boots in both milestones.
+- **Mutations:**
+  - SPARK: 9 of 9 rejected (the server's hart unchecked, a client outside
+    `Held` not marked, the old floor, a server that waits for someone, a
+    floor that is not lowered, waking the client without its floor,
+    `Wake_Boost` without `Quiet`, a weaker `Quiet`, `Scan` keeping the last
+    client instead of the highest).
+  - Runtime: 21 of 23, including those ported from milestones 23, 25, 29,
+    30 and 31. The first round left 5 alive and 3 whose patterns did not
+    compile:
+    - one survived because it mutated dead code (`ipc.readopt`, removed);
+    - three are detected by the new same-hart tests, and the cross-hart
+      shortcut from milestone 23 by the low-priority round;
+    - two still survive, the known weakness since milestone 25: not
+      yielding on the own hart after the floor drops (one of them is the new
+      "never notify the own hart when replying"). The next tick corrects the
+      choice, and no test measures that latency in a stable way.
+  - Milestone 27: 7 of 9 (the two races only Debug detects). Milestones 22
+    to 26: the usual survivors (two memory-ordering ones, idle at normal
+    priority, the redundant cross-hart loan guard); two do not compile.
+- **Limits:**
+  - The worst case of the cross-hart inversion went from 253 to 439 µs
+    (one call out of 1280, identical in three runs) while the minimum and
+    the median improved. It looks like the alignment with QEMU's turns under
+    `-icount` seen in earlier milestones, but I have not isolated it.
+  - `Quiet` is checked at run time in `Wake_Boost`. That a server waiting in
+    `recv`, or a client waiting for a reply from another hart, always
+    satisfies it is an argument about the kernel, not a proof; if it ever
+    failed, the kernel would stop with a clear message.
+  - That `Held` matches the locks really taken is still Zig code: SPARK
+    checks the set it is given, not the locks.
+  - The rule is proved to be preserved by calls and replies across harts.
+    On the same hart it still travels with the lent context and is checked
+    by Debug.
+  - Measurements are from QEMU with `-icount`, not real hardware.
 
 ## Milestone 31 — The inheritance rule, proved
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Driver de la UART 16550 de Fabianus. Es un proceso de usuario corriente: si
 //! falla, muere él solo y el kernel puede arrancar otro.
 //!

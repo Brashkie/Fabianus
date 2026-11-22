@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Autopruebas de los harts secundarios, del cerrojo y de la planificación por
 //! hart.
 
@@ -155,11 +156,14 @@ const send: u64 = abi.FB_RIGHT_SEND;
 const recv: u64 = abi.FB_RIGHT_RECV;
 
 /// 65 llamadas (64 y la de parada) entre un cliente y un servidor en los
-/// harts indicados. Devuelve cuánto tardaron, en unidades del reloj.
-fn callRound(server_hart: u64, client_hart: u64) u64 {
+/// harts indicados. Devuelve cuánto tardaron, en unidades del reloj. Con
+/// `low`, el cliente pasa a la prioridad mínima: el servidor no hereda nada y
+/// contesta por el camino sin herencia.
+fn callRound(server_hart: u64, client_hart: u64, low: bool) u64 {
     const begin = timer.now();
     const server = process.spawnWithOn(server_hart, .call_server, 1, &.{selftest_ipc.endpoint(0, 0, recv)}) orelse @panic("no se pudo crear el proceso");
     const client = process.spawnWithOn(client_hart, .call_client, 1, &.{selftest_ipc.endpoint(0, 0, send)}) orelse @panic("no se pudo crear el proceso");
+    if (low) thread.setParams(client, abi.FB_PRIO_LOW, abi.FB_SCHED_DEFAULT_BUDGET);
     waitExit(client, 0);
     waitExit(server, 0);
     return timer.now() - begin;
@@ -168,10 +172,11 @@ fn callRound(server_hart: u64, client_hart: u64) u64 {
 /// Cliente y servidor en harts distintos: las llamadas funcionan, sin cesión
 /// directa ni préstamo. Se compara con el mismo par en un solo hart.
 fn testCrossHartCall(harts: u64) void {
-    const same = callRound(0, 0);
+    const same = callRound(0, 0, false);
     const received_before = ipi.received(harts - 1);
     const switches_before = thread.notifiedSwitches();
-    const cross = callRound(0, harts - 1);
+    const cross = callRound(0, harts - 1, false);
+    _ = callRound(0, harts - 1, true);
     // Con varios harts, despertar al cliente del otro hart pasa por un aviso,
     // y el aviso pone a correr al despertado sin esperar al tick.
     if (harts > 1 and ipi.received(harts - 1) == received_before) @panic("las llamadas entre harts no usaron avisos");
@@ -385,15 +390,22 @@ fn spawnOrPanic2(target: u64, entry: thread.Entry, argument: u64) u64 {
 
 /// Un hilo de prioridad mínima comparte nivel con el hilo en reposo de su
 /// hart: cuando el turno pasa al reposo, el hart no puede dormirse sin tick.
+/// Empieza a contar cuando ya tiene su prioridad: con el anfitrión saturado,
+/// el hart que lo crea puede tardar más que su giro en llegar a fijarla.
+var low_go: u64 = 0;
+
 fn lowSpinner(_: u64) callconv(.c) void {
+    while (@atomicLoad(u64, &low_go, .acquire) == 0) {}
     const end = timer.now() + 3 * abi.FB_TIMEBASE_HZ / 100;
     while (timer.now() < end) {}
 }
 
 fn testLowOnIdleHart(harts: u64) void {
     const target = harts - 1;
+    @atomicStore(u64, &low_go, 0, .release);
     const id = spawnOrPanic2(target, lowSpinner, 0);
     thread.setParams(id, abi.FB_PRIO_LOW, abi.FB_SCHED_DEFAULT_BUDGET);
+    @atomicStore(u64, &low_go, 1, .release);
     waitAll(&.{id});
     passed("un hilo de prioridad minima en otro hart termina aunque comparta turno con el reposo");
 }
@@ -439,6 +451,7 @@ fn testCrossHartInheritance(harts: u64) void {
     while (timer.now() < settle) thread.yield();
 
     const boosts_before = ipc.boosts();
+    const retries = thread.unheldRetries();
     const begin = timer.now();
     const client = process.spawnWithOn(0, .call_once, 1, &.{selftest_ipc.endpoint(0, 0, send)}) orelse @panic("no se pudo crear el proceso");
     thread.setParams(client, abi.FB_PRIO_TOP, abi.FB_SCHED_DEFAULT_BUDGET);
@@ -448,6 +461,8 @@ fn testCrossHartInheritance(harts: u64) void {
     waitAll(&.{spinner});
 
     if (ipc.boosts() == boosts_before) @panic("el servidor de otro hart no heredo la prioridad");
+    // Sin aplazados en otros harts bastan los cerrojos de los dos harts.
+    if (thread.unheldRetries() != retries) @panic("sin aplazados en otros harts, llamar o contestar pidio todos los cerrojos");
     if (thread.priorityOf(server) != abi.FB_PRIO_LOW) @panic("el servidor no volvio a su prioridad");
     process.requestKill(server);
     waitAll(&.{server});
@@ -735,9 +750,11 @@ fn testReplyDropsInheritance(harts: u64) void {
     thread.setParams(local, abi.FB_PRIO_NORMAL, abi.FB_SCHED_DEFAULT_BUDGET);
     waitFor(holdsCall, &.{ server, local }, "el servidor no aplazo la llamada de su hart");
 
+    const retries = thread.unheldRetries();
     const remote = process.spawnWithOn(0, .call_once, 7, &.{selftest_ipc.endpoint(0, 0, send)}) orelse @panic("no se pudo crear el proceso");
     thread.setParams(remote, abi.FB_PRIO_TOP, abi.FB_SCHED_DEFAULT_BUDGET);
     waitFor(answeredAndWaiting, &.{ server, remote }, "el servidor no contesto al cliente de otro hart");
+    if (thread.unheldRetries() != retries) @panic("con el aplazado en el hart del servidor, contestar pidio todos los cerrojos");
     if (process.resultOf(remote).value != 0) @panic("la respuesta al cliente de otro hart fue erronea");
 
     if (thread.contextOf(server) != local) @panic("contestar solto el contexto del aplazado");
@@ -746,6 +763,208 @@ fn testReplyDropsInheritance(harts: u64) void {
     process.requestKill(server);
     waitAll(&.{ server, local });
     passed("contestar con reply quita lo heredado de otro hart y conserva el contexto del aplazado");
+}
+
+/// Un servidor del hart 1 aplaza la llamada de un cliente urgente del hart 2.
+/// Llega después la de un cliente del hart 0: los cerrojos de los harts 0 y 1
+/// no bastan para recalcular su suelo, porque el aplazado vive en el 2. SPARK
+/// lo dice sin tocar nada y se repite con todos. El servidor sigue con la
+/// urgencia del aplazado.
+fn testCallNeedsAllHarts(harts: u64) void {
+    if (harts < 3) {
+        passed("con menos de 3 harts no hay aplazados en un tercer hart al llamar");
+        return;
+    }
+    const server = process.spawnWithOn(1, .defer_three, 0, &.{
+        selftest_ipc.endpoint(0, 0, recv),
+        selftest_ipc.endpoint(1, 1, recv),
+    }) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(server, abi.FB_PRIO_LOW, abi.FB_SCHED_DEFAULT_BUDGET);
+    waitBlockedSmp(server);
+
+    const far = process.spawnWithOn(2, .call_expect_peer, 0, &.{selftest_ipc.endpoint(0, 0, send)}) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(far, abi.FB_PRIO_TOP, abi.FB_SCHED_DEFAULT_BUDGET);
+    waitFor(holdsCall, &.{ server, far }, "el servidor no aplazo la llamada del tercer hart");
+    if (thread.priorityOf(server) != abi.FB_PRIO_TOP) @panic("el servidor no heredo del aplazado del tercer hart");
+
+    const retries = thread.unheldRetries();
+    const near = process.spawnWithOn(0, .call_expect_peer, 0, &.{selftest_ipc.endpoint(0, 0, send)}) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(near, abi.FB_PRIO_NORMAL, abi.FB_SCHED_DEFAULT_BUDGET);
+    waitFor(holdsCall, &.{ server, near }, "el servidor no aplazo la llamada del hart 0");
+    if (thread.unheldRetries() == retries) @panic("con un aplazado en un tercer hart, llamar no pidio todos los cerrojos");
+    if (thread.priorityOf(server) != abi.FB_PRIO_TOP) @panic("al llamar, el servidor perdio la urgencia del aplazado del tercer hart");
+    if (!ipc.ruleHolds()) @panic("con un aplazado en un tercer hart no se cumple la regla de la herencia");
+
+    process.requestKill(far);
+    waitAll(&.{far});
+    if (thread.priorityOf(server) != abi.FB_PRIO_NORMAL) @panic("muerto el aplazado urgente, el servidor no bajo a la urgencia del otro");
+
+    process.requestKill(server);
+    waitAll(&.{ server, near });
+    passed("llamar y heredar repite con todos los cerrojos si un aplazado vive en un tercer hart");
+}
+
+/// Un servidor del hart 1 aplaza la llamada de un cliente del hart 2 y
+/// contesta con reply a la de un cliente urgente del hart 0. Tampoco bastan
+/// los cerrojos de los harts 0 y 1: se repite con todos, y el servidor baja a
+/// la urgencia del aplazado que le queda.
+fn testReplyNeedsAllHarts(harts: u64) void {
+    if (harts < 3) {
+        passed("con menos de 3 harts no hay aplazados en un tercer hart al contestar");
+        return;
+    }
+    const server = process.spawnWithOn(1, .defer_then_serve, 0, &.{
+        selftest_ipc.endpoint(0, 0, recv),
+        selftest_ipc.endpoint(1, 1, recv),
+    }) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(server, abi.FB_PRIO_LOW, abi.FB_SCHED_DEFAULT_BUDGET);
+    waitBlockedSmp(server);
+
+    const far = process.spawnWithOn(2, .call_expect_peer, 0, &.{selftest_ipc.endpoint(0, 0, send)}) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(far, abi.FB_PRIO_NORMAL, abi.FB_SCHED_DEFAULT_BUDGET);
+    waitFor(holdsCall, &.{ server, far }, "el servidor no aplazo la llamada del tercer hart");
+
+    const retries = thread.unheldRetries();
+    const near = process.spawnWithOn(0, .call_once, 7, &.{selftest_ipc.endpoint(0, 0, send)}) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(near, abi.FB_PRIO_TOP, abi.FB_SCHED_DEFAULT_BUDGET);
+    waitFor(answeredAndWaiting, &.{ server, near }, "el servidor no contesto al cliente del hart 0");
+    if (process.resultOf(near).value != 0) @panic("la respuesta al cliente del hart 0 fue erronea");
+    // Una al llamar y otra al contestar.
+    if (thread.unheldRetries() - retries < 2) @panic("con un aplazado en un tercer hart, contestar no pidio todos los cerrojos");
+    if (thread.priorityOf(server) != abi.FB_PRIO_NORMAL) @panic("contestar no dejo al servidor con la urgencia del aplazado del tercer hart");
+    if (!ipc.ruleHolds()) @panic("tras contestar con un aplazado en un tercer hart no se cumple la regla de la herencia");
+
+    process.requestKill(server);
+    waitAll(&.{ server, far });
+    passed("responder y heredar repite con todos los cerrojos si un aplazado vive en un tercer hart");
+}
+
+/// Un servidor del hart 1 aplaza la llamada de un cliente normal de su hart.
+/// Un reenviador de ese mismo hart, que hereda la urgencia máxima de un
+/// cliente del hart 0, le llama y recibe la respuesta con reply. Al contestar
+/// a alguien de su hart, el servidor debe soltar lo heredado y volver a la
+/// urgencia del aplazado.
+fn testSameHartReplyDropsFloor(harts: u64) void {
+    if (harts < 2) {
+        passed("con un solo hart no hay suelo heredado que soltar en el mismo hart");
+        return;
+    }
+    const hart_s: u64 = 1;
+    const server = process.spawnWithOn(hart_s, .defer_then_serve, 0, &.{
+        selftest_ipc.endpoint(0, 0, recv),
+        selftest_ipc.endpoint(1, 1, recv),
+    }) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(server, abi.FB_PRIO_LOW, abi.FB_SCHED_DEFAULT_BUDGET);
+    waitBlockedSmp(server);
+
+    const deferred = process.spawnWithOn(hart_s, .call_expect_peer, 0, &.{selftest_ipc.endpoint(0, 0, send)}) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(deferred, abi.FB_PRIO_NORMAL, abi.FB_SCHED_DEFAULT_BUDGET);
+    waitFor(holdsCall, &.{ server, deferred }, "el servidor no aplazo la llamada de su hart");
+
+    const forwarder = process.spawnWithOn(hart_s, .call_forwarder, 0, &.{
+        selftest_ipc.endpoint(0, 2, recv),
+        selftest_ipc.endpoint(1, 0, send),
+    }) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(forwarder, abi.FB_PRIO_LOW, abi.FB_SCHED_DEFAULT_BUDGET);
+    waitBlockedSmp(forwarder);
+
+    const client = process.spawnWithOn(0, .call_once, 7, &.{selftest_ipc.endpoint(0, 2, send)}) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(client, abi.FB_PRIO_TOP, abi.FB_SCHED_DEFAULT_BUDGET);
+    waitFor(answeredAndWaiting, &.{ server, client }, "la llamada a traves del reenviador no termino");
+    if (process.resultOf(client).value != 0) @panic("la respuesta a traves del reenviador fue erronea");
+
+    if (thread.priorityOf(server) != abi.FB_PRIO_NORMAL) @panic("al contestar a uno de su hart, el servidor no solto lo heredado");
+    if (thread.priorityOf(forwarder) != abi.FB_PRIO_LOW) @panic("al contestar, el reenviador no solto lo heredado");
+    if (!ipc.ruleHolds()) @panic("tras contestar en el mismo hart no se cumple la regla de la herencia");
+
+    process.requestKill(forwarder);
+    process.requestKill(server);
+    waitAll(&.{ forwarder, server, deferred });
+    passed("contestar a un cliente del mismo hart suelta el suelo que este le habia pasado");
+}
+
+/// ids[0] terminó e ids[1] e ids[2] esperan.
+fn doneAndIdle(ids: []const u64) bool {
+    return !thread.isAlive(ids[0]) and thread.state(ids[1]) == abi.FB_THREAD_BLOCKED and
+        thread.state(ids[2]) == abi.FB_THREAD_BLOCKED;
+}
+
+/// Lo mismo que testSameHartReplyDropsFloor, pero el servidor contesta con
+/// reply_recv y se queda esperando: también debe soltar lo heredado.
+fn testSameHartReplyRecvDropsFloor(harts: u64) void {
+    if (harts < 2) {
+        passed("con un solo hart no hay suelo heredado que soltar con reply_recv");
+        return;
+    }
+    const hart_s: u64 = 1;
+    const server = process.spawnWithOn(hart_s, .call_server, 1, &.{selftest_ipc.endpoint(0, 1, recv)}) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(server, abi.FB_PRIO_LOW, abi.FB_SCHED_DEFAULT_BUDGET);
+    waitBlockedSmp(server);
+
+    const forwarder = process.spawnWithOn(hart_s, .call_forwarder, 0, &.{
+        selftest_ipc.endpoint(0, 0, recv),
+        selftest_ipc.endpoint(1, 1, send),
+    }) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(forwarder, abi.FB_PRIO_LOW, abi.FB_SCHED_DEFAULT_BUDGET);
+    waitBlockedSmp(forwarder);
+
+    const client = process.spawnWithOn(0, .call_once, 7, &.{selftest_ipc.endpoint(0, 0, send)}) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(client, abi.FB_PRIO_TOP, abi.FB_SCHED_DEFAULT_BUDGET);
+    waitFor(doneAndIdle, &.{ client, server, forwarder }, "la llamada a traves del reenviador no termino");
+    if (process.resultOf(client).value != 0) @panic("la respuesta a traves del reenviador fue erronea");
+
+    if (thread.priorityOf(server) != abi.FB_PRIO_LOW) @panic("al contestar con reply_recv a uno de su hart, el servidor no solto lo heredado");
+    if (thread.priorityOf(forwarder) != abi.FB_PRIO_LOW) @panic("al contestar, el reenviador no solto lo heredado");
+    if (!ipc.ruleHolds()) @panic("tras contestar con reply_recv en el mismo hart no se cumple la regla de la herencia");
+
+    process.requestKill(forwarder);
+    process.requestKill(server);
+    waitAll(&.{ forwarder, server });
+    passed("contestar con reply_recv a un cliente del mismo hart suelta el suelo que este le habia pasado");
+}
+
+/// Un cliente urgente del hart 0 llama a un reenviador del hart 1, que hereda
+/// su urgencia y llama a un servidor de su hart que aún no existe: la llamada
+/// espera en cola. Al recibirla, el servidor hereda el suelo del reenviador
+/// aunque sean del mismo hart, porque el contexto prestado no lo lleva.
+fn testSameHartQueueInheritsFloor(harts: u64) void {
+    if (harts < 2) {
+        passed("con un solo hart no hay suelo que pasar por la cola en el mismo hart");
+        return;
+    }
+    const hart_s: u64 = 1;
+    const client = process.spawnWithOn(0, .call_expect_peer, 0, &.{selftest_ipc.endpoint(0, 0, send)}) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(client, abi.FB_PRIO_TOP, abi.FB_SCHED_DEFAULT_BUDGET);
+    waitBlockedSmp(client);
+
+    const forwarder = process.spawnWithOn(hart_s, .call_forwarder, 0, &.{
+        selftest_ipc.endpoint(0, 0, recv),
+        selftest_ipc.endpoint(1, 1, send),
+    }) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(forwarder, abi.FB_PRIO_LOW, abi.FB_SCHED_DEFAULT_BUDGET);
+    const limit = timer.now() + 10 * abi.FB_TIMEBASE_HZ;
+    while (thread.state(forwarder) != abi.FB_THREAD_BLOCKED or abi.fb_ipc_waits_for(client) != forwarder) {
+        if (timer.now() > limit) @panic("el reenviador no llego a llamar");
+        thread.yield();
+    }
+    if (thread.priorityOf(forwarder) != abi.FB_PRIO_TOP) @panic("el reenviador no heredo del cliente de otro hart");
+
+    const server = process.spawnWithOn(hart_s, .call_server_lost, 0, &.{selftest_ipc.endpoint(0, 1, recv)}) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(server, abi.FB_PRIO_LOW, abi.FB_SCHED_DEFAULT_BUDGET);
+    while (sleep.earliest() == abi.FB_SLEEP_NONE) {
+        if (!thread.isAlive(server) or timer.now() > limit) @panic("el servidor no llego a dormirse");
+        thread.yield();
+    }
+    if (thread.priorityOf(server) != abi.FB_PRIO_TOP) @panic("recibir de la cola a uno de su hart que hereda no hizo heredar al servidor");
+    if (!ipc.ruleHolds()) @panic("con la llamada recibida de la cola no se cumple la regla de la herencia");
+
+    process.requestKill(client);
+    waitAll(&.{client});
+    if (thread.priorityOf(server) != abi.FB_PRIO_LOW) @panic("muerto el cliente, el servidor siguio con lo heredado");
+    process.requestKill(forwarder);
+    process.requestKill(server);
+    waitAll(&.{ forwarder, server });
+    passed("recibir de la cola a un cliente del mismo hart que hereda pasa el suelo al servidor");
 }
 
 pub fn run(harts: u64) void {
@@ -769,4 +988,9 @@ pub fn run(harts: u64) void {
     testTransitiveInheritance(harts);
     testBorrowedContextInherits(harts);
     testReplyDropsInheritance(harts);
+    testCallNeedsAllHarts(harts);
+    testReplyNeedsAllHarts(harts);
+    testSameHartReplyDropsFloor(harts);
+    testSameHartReplyRecvDropsFloor(harts);
+    testSameHartQueueInheritsFloor(harts);
 }
