@@ -4,9 +4,10 @@ package body Cap_Core with
   Refined_State => (State => Store)
 is
    Empty : constant Cap :=
-     (Kind => None, Object => 0, Send => False, Recv => False, Grant => False);
+     (Kind => None, Object => 0, Send => False, Recv => False, Grant => False,
+      Badge => 0);
 
-   Store : Cap_Store := (others => (others => (None, 0, False, False, False)));
+   Store : Cap_Store := (others => (others => (None, 0, False, False, False, 0)));
 
    function Snapshot return Cap_Store is (Store);
 
@@ -21,6 +22,25 @@ is
    begin
       null;
    end Lemma_Witness;
+
+   procedure Lemma_Badges_Kept (After, Before : Cap_Store) is
+   begin
+      for P in Proc_Id loop
+         for S in Slot_Id loop
+            pragma Assert (Is_Covered (After (P) (S), Before));
+            pragma Loop_Invariant
+              (for all T in Slot_Id =>
+                 (if T <= S and then After (P) (T).Kind /= None
+                  then Badge_Known (After (P) (T).Badge, Before)));
+         end loop;
+         pragma Loop_Invariant
+           (for all R in Proc_Id =>
+              (if R <= P
+               then (for all T in Slot_Id =>
+                       (if After (R) (T).Kind /= None
+                        then Badge_Known (After (R) (T).Badge, Before)))));
+      end loop;
+   end Lemma_Badges_Kept;
 
    --  A solo difiere de B en una entrada, vacía o derivada de B (Q) (W).
    procedure Lemma_One_Copy
@@ -97,6 +117,15 @@ is
    function Grant
      (Proc, Slot, Kind, Object, Rights : U64) return U64
    is
+      Result : U64;
+   begin
+      Result := Grant_Badged (Proc, Slot, Kind, Object, Rights, 0);
+      return Result;
+   end Grant;
+
+   function Grant_Badged
+     (Proc, Slot, Kind, Object, Rights, Badge : U64) return U64
+   is
    begin
       if not Valid_Proc (Proc)
         or else not Valid_Slot (Slot)
@@ -116,9 +145,18 @@ is
          Object => Object_Id (Object),
          Send   => (Rights and Right_Send) /= 0,
          Recv   => (Rights and Right_Recv) /= 0,
-         Grant  => (Rights and Right_Grant) /= 0);
+         Grant  => (Rights and Right_Grant) /= 0,
+         Badge  => Badge);
       return Status_Ok;
-   end Grant;
+   end Grant_Badged;
+
+   function Badge_Of (Proc, Slot : U64) return U64 is
+   begin
+      if not Valid_Proc (Proc) or else not Valid_Slot (Slot) then
+         return 0;
+      end if;
+      return Store (Proc_Id (Proc)) (Slot_Id (Slot)).Badge;
+   end Badge_Of;
 
    function Refers (Kind, Object : U64) return U64 is
    begin
@@ -235,7 +273,8 @@ is
             Object => From.Object,
             Send   => (Rights and Right_Send) /= 0,
             Recv   => (Rights and Right_Recv) /= 0,
-            Grant  => (Rights and Right_Grant) /= 0);
+            Grant  => (Rights and Right_Grant) /= 0,
+            Badge  => From.Badge);
       begin
          if From.Kind = None
            or else (Copy.Send and then not From.Send)

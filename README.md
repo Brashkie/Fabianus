@@ -16,7 +16,7 @@ All kernel code is original. Linux is used only as a point of comparison.
 
 ## Status
 
-Milestone 34 of an ongoing series. The kernel runs on QEMU `virt`
+Milestone 39 of an ongoing series. The kernel runs on QEMU `virt`
 (rv64imac), up to 4 harts, without any firmware (`-bios none`).
 
 - **Memory:** physical frame allocator proven in SPARK, Sv39 paging, PMP.
@@ -28,7 +28,9 @@ Milestone 34 of an ongoing series. The kernel runs on QEMU `virt`
   the same frame if it belongs to a region both have joined.
 - **Authority:** capabilities for console, IPC endpoints, devices and shared
   regions. Each device page (UART, disk) belongs to at most one process at a
-  time, proved in SPARK.
+  time, proved in SPARK. Capabilities can carry a badge that only the kernel
+  sets; a server receives the sender's badge with every message, and SPARK
+  proves that no operation a process can ask for creates a new badge.
 - **IPC:** synchronous send/recv, call/reply, reply_recv and deferred replies,
   with direct CPU hand-off between client and server.
 - **Scheduler** (proved in SPARK):
@@ -56,13 +58,38 @@ Milestone 34 of an ongoing series. The kernel runs on QEMU `virt`
 - **Storage:** a virtio-blk disk. Clients call the driver with an operation,
   a sector and a page of the region they share with it; the data never
   passes through the kernel.
+- **Files:** a minimal file system served by a user process in Rust: 64
+  entries (files of up to 64 KiB and directories), reached by paths such as
+  `/docs/notes/a`, with rename across directories. Every decision about the
+  on-disk format is taken by a SPARK package linked into that server, proved
+  to never give one block to two files, to keep names unique in each
+  directory, to never let the directory tree form a cycle, and to mount only
+  a valid disk. File data moves by DMA straight between the disk and the
+  client.
+- **Handles:** a handle is a small number that the file system server gives
+  to one client, like a Linux file descriptor, and that is worth nothing to
+  any other client. The server tells clients apart by a badge that only the
+  kernel puts on capabilities and delivers with every message. Behind each
+  handle is the generation of the table entry it names: deleting raises it,
+  so a handle open on a deleted file answers `STALE`, even after another
+  file takes its entry. SPARK proves that no operation lowers a generation,
+  that a client only reaches what it opened itself, and that no request
+  changes another client's handles.
+- **Power cuts:** every file system operation is atomic. Rewrites go to a
+  free block (copy on write), data reaches the disk before the table that
+  names it, and each operation (rename across directories included)
+  changes one table entry inside one sector. SPARK proves that the block
+  being written belongs to no file of the table on disk. Each boot cuts the
+  power at every sector of a test workload (467 cuts) and checks that the
+  disk holds the state before or after the interrupted operation, down to
+  the entry and generation of every file.
 
 ## Verification
 
-- **Proofs:** GNATprove proves 2240 checks over the whole SPARK code base,
+- **Proofs:** GNATprove proves 2918 checks over the whole SPARK code base,
   with nothing left unproved. The proof runs before every build, and a
   failure stops it.
-- **Self-tests:** 137 tests run on every boot, with 1 and with 4 harts, in
+- **Self-tests:** 147 tests run on every boot, with 1 and with 4 harts, in
   Debug and in optimized builds, and under stress with several QEMU
   instances at once.
 - **Mutation testing:** every milestone breaks its own code and
@@ -89,6 +116,11 @@ are the median of 5 runs, measured at milestone 33 against Linux 6.12 with
 | 4 KiB to another hart and a sum back | 11134 (shared region) | 29709 (shared memory and futex) |
 | The same, copying | 623556 (IPC, 32 bytes per call) | 32634 (pipe) |
 | Create and map 64 KiB, writing its 16 pages | 17800 | 92500 (`mmap` and page faults) |
+| Look up a path of one name, no disk (milestone 38) | 3891 | 4914 (`stat`, cached) |
+| Look up a path of 4 names, no disk (milestone 38) | 5674 | 5915 (`stat`, cached) |
+| Open and close, path of one name (milestone 39) | 6667 (`LOOKUP` + `CLOSE`) | 7873 (`open` + `close`) |
+| Open and close, path of 4 names (milestone 39) | 8503 (`LOOKUP` + `CLOSE`) | 8804 (`open` + `close`) |
+| Use a handle without the disk (milestone 39) | 2785 (`STAT`) | 1661 (`fstat`) |
 
 Fabianus moves bulk data through shared regions; its IPC carries 32 bytes
 per message and has no bulk copy, which is why copying is slow.
@@ -98,6 +130,19 @@ machine (client, kernel and driver; milestone 34). Disk latency cannot be
 measured reliably in QEMU, and in this setup Linux does not let user mode
 read the instruction counter, so there is no Linux figure for the disk.
 
+Fabianus scans its 64-entry table for each name of a path (5150 ns for a
+name in the last entry), while Linux uses a hashed name cache whose cost
+does not grow with the directory: each extra name of a path costs Fabianus
+about 590 ns and Linux about 330 ns. Opening and closing costs Fabianus two
+round trips to the file system server, still a little less than `open` and
+`close` in Linux; using a handle costs one round trip, 1.7 times a Linux
+`fstat`, which does not leave the process. Renaming a file across directories costs Fabianus about
+13,300 instructions including the table write to disk; Linux takes
+15,617 ns in memory, without touching a disk.
+Reading 4 KiB of a file through the file system server costs about 8,300
+instructions, about 3,100 more than a raw disk read. Rewriting 4 KiB of a
+file with copy on write (milestone 36) costs about 14,200 instructions.
+
 These are emulator measurements, not real hardware.
 
 ## Languages
@@ -105,9 +150,9 @@ These are emulator measurements, not real hardware.
 | Language | Role |
 |---|---|
 | Zig | Kernel core |
-| Ada/SPARK | Formally verified components (scheduler, IPC, capabilities, memory, inheritance) |
+| Ada/SPARK | Formally verified components (scheduler, IPC, capabilities, memory, inheritance, file system format, file handles) |
 | Assembly | Boot, traps, context switch |
-| Rust | UART and disk drivers (user processes) |
+| Rust | UART and disk drivers, file system server (user processes) |
 | C | Common ABI header and Linux comparison programs |
 | D, VHDL | Planned |
 
@@ -121,6 +166,9 @@ kernel/
   spark/src/      SPARK packages and their proofs
   drivers/uart/   UART driver (Rust)
   drivers/disk/   virtio-blk disk driver (Rust)
+  servers/fs/     file system server (Rust, with the SPARK core linked in)
+  lib/fb_user/    system calls for user programs in Rust
+  tests/          test programs in Rust (file system checks, power cuts)
   tools/          ABI generator, test disk generator (mkdisk) and Linux
                   comparison tools
 CHANGELOG.md      milestone-by-milestone record
@@ -139,7 +187,7 @@ From `kernel/`:
 
 ```
 zig build run                     # build (proofs first) and boot in QEMU, 1 hart,
-                                  # with a generated 1 MiB test disk (snapshot=on)
+                                  # with a generated 2 MiB test disk (snapshot=on)
 zig build run -Dsmp=4             # 4 harts
 zig build run -Drelease           # optimized build
 zig build run -Drelease -Dbench=true   # benchmark instead of self-tests, with -icount

@@ -24,6 +24,11 @@ pub fn endpoint(slot: u64, object: u64, rights: u64) Grant {
     return .{ .slot = slot, .kind = abi.FB_CAP_ENDPOINT, .object = object, .rights = rights };
 }
 
+/// Un endpoint con marca: quien recibe por él sabe que viene de este proceso.
+pub fn badged(slot: u64, object: u64, rights: u64, badge: u64) Grant {
+    return .{ .slot = slot, .kind = abi.FB_CAP_ENDPOINT, .object = object, .rights = rights, .badge = badge };
+}
+
 pub fn console(slot: u64) Grant {
     return .{ .slot = slot, .kind = abi.FB_CAP_CONSOLE, .object = 0, .rights = send };
 }
@@ -128,6 +133,44 @@ fn testCapabilityGate() void {
     expectEqual(abi.fb_cap_held(1, 0), 0);
     expectEqual(abi.fb_cap_held(2, 3), 0);
     passed("las capabilities rechazan peticiones invalidas");
+}
+
+/// Las marcas solo las pone el kernel: derivar y ceder las conservan, y
+/// derivar no puede quitarlas.
+fn testBadges() void {
+    const kind = abi.FB_CAP_ENDPOINT;
+    const ok = abi.FB_CAP_OK;
+    const badge: u64 = 0xbad9_e000_0000_0039;
+
+    expectEqual(abi.fb_cap_grant_badged(1, 0, kind, 0, 8, badge), abi.FB_CAP_INVALID);
+    expectEqual(abi.fb_cap_grant_badged(1, 0, kind, 2, send | grant, badge), ok);
+    expectEqual(abi.fb_cap_grant_badged(1, 0, kind, 2, send, 7), abi.FB_CAP_OCCUPIED);
+    expectEqual(abi.fb_cap_badge(1, 0), badge);
+    expectEqual(abi.fb_cap_grant(1, 1, kind, 2, send), ok);
+    expectEqual(abi.fb_cap_badge(1, 1), 0);
+    expectEqual(abi.fb_cap_badge(1, 2), 0);
+    expectEqual(abi.fb_cap_badge(0, 0), 0);
+    expectEqual(abi.fb_cap_badge(5, 0), 0);
+    expectEqual(abi.fb_cap_badge(1, 16), 0);
+
+    expectEqual(abi.fb_cap_derive(1, 0, 2, send), ok);
+    expectEqual(abi.fb_cap_badge(1, 2), badge);
+    expectEqual(abi.fb_cap_transfer(1, 2, 2, 5), ok);
+    expectEqual(abi.fb_cap_badge(2, 5), badge);
+    expectEqual(abi.fb_cap_check(2, 5, kind, send), 2);
+    expectEqual(abi.fb_cap_transfer(1, 1, 2, 6), ok);
+    expectEqual(abi.fb_cap_badge(2, 6), 0);
+
+    // Borrar y volver a conceder sin marca: no queda nada de la anterior.
+    expectEqual(abi.fb_cap_delete(1, 0), ok);
+    expectEqual(abi.fb_cap_badge(1, 0), 0);
+    expectEqual(abi.fb_cap_grant(1, 0, kind, 2, send), ok);
+    expectEqual(abi.fb_cap_badge(1, 0), 0);
+
+    expectEqual(abi.fb_cap_clear(1), ok);
+    expectEqual(abi.fb_cap_clear(2), ok);
+    expectEqual(abi.fb_cap_badge(2, 5), 0);
+    passed("las marcas de las capabilities solo las pone el kernel y derivar o ceder las conserva");
 }
 
 fn testIpcGate() void {
@@ -256,6 +299,7 @@ fn testCapabilitiesDieWithTheProcess() void {
 
 pub fn run() void {
     testCapabilityGate();
+    testBadges();
     testIpcGate();
 
     const frames_before = selftest_user.poisonFreeFrames();

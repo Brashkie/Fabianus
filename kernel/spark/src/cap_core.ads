@@ -9,6 +9,13 @@
 --  Grant es la raíz de la autoridad. Solo la usa el kernel al crear un proceso
 --  y ninguna llamada al sistema conduce a ella.
 --
+--  Marcas (Hito 39). Cada capability lleva una marca (Badge) que solo pone el
+--  kernel al concederla (Grant_Badged). Derivar y ceder la conservan: Covered
+--  exige la misma marca, así que ningún proceso puede fabricar una
+--  capability con la marca de otro ni quitarle la suya. Quien recibe por un
+--  endpoint ve la marca de la capability con que le enviaron: sabe qué
+--  cliente es, sin poder ser engañado.
+--
 --  No es reentrante: quien llama debe tener las interrupciones apagadas.
 
 pragma Unevaluated_Use_Of_Old (Allow);
@@ -40,6 +47,7 @@ is
       Send   : Boolean;
       Recv   : Boolean;
       Grant  : Boolean;
+      Badge  : U64;
    end record;
 
    type Cap_Table is array (Slot_Id) of Cap;
@@ -80,11 +88,12 @@ is
         when Right_Grant => C.Grant,
         when others      => False);
 
-   --  Src tiene el mismo objeto y al menos los derechos de C.
+   --  Src tiene el mismo objeto, la misma marca y al menos los derechos de C.
    function Subsumes (Src, C : Cap) return Boolean is
      (Src.Kind /= None
       and then Src.Kind = C.Kind
       and then Src.Object = C.Object
+      and then Src.Badge = C.Badge
       and then (if C.Send then Src.Send)
       and then (if C.Recv then Src.Recv)
       and then (if C.Grant then Src.Grant));
@@ -100,6 +109,25 @@ is
      (for all P in Proc_Id =>
         (for all S in Slot_Id => Is_Covered (After (P) (S), Before)))
    with Ghost;
+
+   --  La marca ya la llevaba alguna capability de Before.
+   function Badge_Known (Badge : U64; Before : Cap_Store) return Boolean is
+     (for some P in Proc_Id =>
+        (for some S in Slot_Id =>
+           Before (P) (S).Kind /= None and then Before (P) (S).Badge = Badge))
+   with Ghost;
+
+   --  Marcas imposibles de falsificar: tras cualquier operación que pida un
+   --  proceso (Covered), toda capability lleva una marca que ya existía.
+   procedure Lemma_Badges_Kept (After, Before : Cap_Store) with
+     Ghost,
+     Global => null,
+     Pre    => Covered (After, Before),
+     Post   =>
+       (for all P in Proc_Id =>
+          (for all S in Slot_Id =>
+             (if After (P) (S).Kind /= None
+              then Badge_Known (After (P) (S).Badge, Before))));
 
    --  Las tablas de los demás procesos no han cambiado.
    function Others_Unchanged (After, Before : Cap_Store; P : Proc_Id) return Boolean is
@@ -123,6 +151,33 @@ is
      Export,
      Convention    => C,
      External_Name => "fb_cap_grant";
+
+   --  Como Grant, con una marca. Solo para el kernel.
+   function Grant_Badged
+     (Proc, Slot, Kind, Object, Rights, Badge : U64) return U64
+   with
+     Side_Effects,
+     Global        => (In_Out => State),
+     Post          =>
+       (if Grant_Badged'Result = Status_Ok
+        then Valid_Proc (Proc)
+          and then Valid_Slot (Slot)
+          and then Snapshot (Proc_Id (Proc)) (Slot_Id (Slot)).Badge = Badge
+          and then Others_Unchanged (Snapshot, Snapshot'Old, Proc_Id (Proc))),
+     Export,
+     Convention    => C,
+     External_Name => "fb_cap_grant_badged";
+
+   --  La marca de la capability del hueco (0 si no hay ninguna).
+   function Badge_Of (Proc, Slot : U64) return U64 with
+     Global        => (Input => State),
+     Post          =>
+       (if Valid_Proc (Proc) and then Valid_Slot (Slot)
+        then Badge_Of'Result = Snapshot (Proc_Id (Proc)) (Slot_Id (Slot)).Badge
+        else Badge_Of'Result = 0),
+     Export,
+     Convention    => C,
+     External_Name => "fb_cap_badge";
 
    --  Objeto de la capability si tiene ese tipo y ese derecho, o No_Object.
    function Check (Proc, Slot, Kind, Right : U64) return U64 with

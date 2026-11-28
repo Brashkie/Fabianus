@@ -9,6 +9,9 @@
 //!   hueco 2: endpoint de interrupciones, con Recv: solo llegan señales.
 //!   hueco 3: región de la cola (una página), solo suya.
 //!   hueco 4: región de datos, compartida con los clientes.
+//!   hueco 5 (opcional): otra región de datos. Sus páginas siguen, en la
+//!   numeración, a las del hueco 4. El servidor de archivos guarda en la
+//!   primera sus metadatos y comparte la segunda con su cliente.
 //!
 //! Los datos nunca se copian: el disco lee y escribe por DMA directamente en
 //! la región que comparte el cliente. El kernel solo le da la dirección física
@@ -19,6 +22,11 @@
 //!
 //! Atiende las peticiones de una en una: aplaza la llamada, espera la
 //! interrupción del disco y la contesta. No hay variables globales: la imagen es de solo lectura.
+//!
+//! Para las pruebas de cortes de luz, CUT deja escribir un número de sectores
+//! y después «se va la luz»: la escritura que cruza el límite va al disco de
+//! verdad, pero solo con una parte de sus sectores, y nada más llega al disco
+//! hasta POWER. Es inyección de fallos, como dm-flakey en Linux.
 
 #![no_std]
 #![no_main]
@@ -33,6 +41,7 @@ const CAP_DEVICE: u64 = 1;
 const CAP_INTERRUPTS: u64 = 2;
 const CAP_QUEUE: u64 = 3;
 const CAP_DATA: u64 = 4;
+const CAP_EXTRA: u64 = 5;
 
 // Registros de virtio-mmio.
 const REG_MAGIC: usize = 0x000;
@@ -85,7 +94,11 @@ const DESC_WRITE: u16 = 2;
 const REQUEST_IN: u32 = 0;
 const REQUEST_OUT: u32 = 1;
 
-const MAX_DATA_PAGES: usize = 16;
+const SECTOR_BYTES: u64 = 512;
+const PAGE_SECTORS: u64 = FB_DISK_SECTORS_PER_PAGE;
+
+const MAX_DATA_PAGES: usize = FB_DISK_MAX_DATA_PAGES as usize;
+const MAX_REGION_PAGES: u64 = 16;
 
 const EXIT_NO_DEVICE: u64 = 0xe1;
 const EXIT_NOT_VIRTIO_BLOCK: u64 = 0xe2;
@@ -140,6 +153,8 @@ fn recv(cap: u64) -> Message {
             lateout("a3") a3,
             lateout("a4") a4,
             lateout("a5") kind,
+            // La marca de quien envía (Hito 39): este driver no la usa.
+            lateout("a6") _,
             options(nostack),
         );
     }
@@ -321,8 +336,8 @@ fn wait_completion(device: &Mmio, queue: &mut Queue) {
     }
 }
 
-/// Una página entre el disco y la página `data` de la región. Devuelve un FB_DISK_*.
-fn transfer(device: &Mmio, queue: &mut Queue, write: bool, sector: u64, data: u64) -> u64 {
+/// `sectors` sectores entre el disco y la dirección física `data`. Devuelve un FB_DISK_*.
+fn transfer(device: &Mmio, queue: &mut Queue, write: bool, sector: u64, data: u64, sectors: u64) -> u64 {
     queue.put32(HEADER_OFFSET, if write { REQUEST_OUT } else { REQUEST_IN });
     queue.put32(HEADER_OFFSET + 4, 0);
     queue.put64(HEADER_OFFSET + 8, sector);
@@ -331,7 +346,7 @@ fn transfer(device: &Mmio, queue: &mut Queue, write: bool, sector: u64, data: u6
     queue.descriptor(0, queue.phys + HEADER_OFFSET, 16, DESC_NEXT, 1);
     // Al leer, el disco escribe en la página del cliente.
     let data_flags = if write { DESC_NEXT } else { DESC_NEXT | DESC_WRITE };
-    queue.descriptor(1, data, FB_PAGE_SIZE as u32, data_flags, 2);
+    queue.descriptor(1, data, (sectors * SECTOR_BYTES) as u32, data_flags, 2);
     queue.descriptor(2, queue.phys + STATUS_OFFSET, 1, DESC_WRITE, 0);
 
     let index = queue.get16(AVAIL_OFFSET + 2);
@@ -350,6 +365,38 @@ fn transfer(device: &Mmio, queue: &mut Queue, write: bool, sector: u64, data: u6
     }
 }
 
+/// El corte de luz simulado.
+struct Power {
+    /// Hay un corte programado.
+    armed: bool,
+    /// Sectores que aún se escriben antes del corte.
+    left: u64,
+    /// Qué sectores escribe la escritura que cruza el límite.
+    tear: u64,
+    /// Ya se fue la luz.
+    off: bool,
+}
+
+const POWER_ON: Power = Power { armed: false, left: 0, tear: FB_DISK_TEAR_FIRST, off: false };
+
+impl Power {
+    /// Qué parte de una escritura de una página llega al disco: el primer
+    /// sector y cuántos. Si cruza el límite, se va la luz.
+    fn admit(&mut self) -> (u64, u64) {
+        if !self.armed || self.left >= PAGE_SECTORS {
+            if self.armed {
+                self.left -= PAGE_SECTORS;
+            }
+            return (0, PAGE_SECTORS);
+        }
+        let count = self.left;
+        self.left = 0;
+        self.off = true;
+        let first = if self.tear == FB_DISK_TEAR_LAST { PAGE_SECTORS - count } else { 0 };
+        (first, count)
+    }
+}
+
 fn run() -> ! {
     let base = syscall3(FB_SYS_DEVICE_MAP, CAP_DEVICE, 0, 0);
     if failed(base) {
@@ -362,6 +409,12 @@ fn run() -> ! {
     {
         exit(EXIT_NO_MEMORY);
     }
+    // La segunda región es opcional: sin capability en el hueco, no hay.
+    let extra = match syscall3(FB_SYS_REGION_MAP, CAP_EXTRA, FB_DISK_EXTRA_BASE, 0) {
+        0 => true,
+        FB_ERR_CAP => false,
+        _ => exit(EXIT_NO_MEMORY),
+    };
     if syscall3(FB_SYS_IRQ_BIND, CAP_DEVICE, CAP_INTERRUPTS, 0) != 0 {
         exit(EXIT_NO_INTERRUPT);
     }
@@ -376,19 +429,24 @@ fn run() -> ! {
     // que no hay más.
     let mut data = [0u64; MAX_DATA_PAGES];
     let mut pages = 0usize;
-    while pages < MAX_DATA_PAGES {
-        let physical = syscall3(FB_SYS_DMA_ADDRESS, CAP_DATA, pages as u64, CAP_DEVICE);
-        if failed(physical) {
-            break;
+    for (region, present) in [(CAP_DATA, true), (CAP_EXTRA, extra)] {
+        let mut page = 0u64;
+        while present && page < MAX_REGION_PAGES && pages < MAX_DATA_PAGES {
+            let physical = syscall3(FB_SYS_DMA_ADDRESS, region, page, CAP_DEVICE);
+            if failed(physical) {
+                break;
+            }
+            data[pages] = physical;
+            pages += 1;
+            page += 1;
         }
-        data[pages] = physical;
-        pages += 1;
-    }
-    if pages == 0 {
-        exit(EXIT_NO_MEMORY);
+        if page == 0 && present {
+            exit(EXIT_NO_MEMORY);
+        }
     }
 
     let capacity = start(&device, &queue);
+    let mut power = POWER_ON;
 
     loop {
         let message = recv(CAP_REQUESTS);
@@ -403,19 +461,42 @@ fn run() -> ! {
                 exit(0);
             }
             FB_DISK_OP_CAPACITY => reply(FB_DISK_OK, capacity),
+            FB_DISK_OP_CUT => {
+                // a2 = sectores que aún se escriben, a3 = FB_DISK_TEAR_*.
+                if page > FB_DISK_TEAR_LAST {
+                    reply(FB_DISK_ERR_REQUEST, 0);
+                } else {
+                    power = Power { armed: true, left: sector, tear: page, off: false };
+                    reply(FB_DISK_OK, 0);
+                }
+            }
+            FB_DISK_OP_POWER => {
+                power = POWER_ON;
+                reply(FB_DISK_OK, 0);
+            }
             FB_DISK_OP_READ | FB_DISK_OP_WRITE => {
                 // La página y los sectores se comprueban aquí; el disco
                 // también rechazaría sectores fuera de rango.
                 let fits = sector <= capacity && capacity - sector >= FB_DISK_SECTORS_PER_PAGE;
+                let write = operation == FB_DISK_OP_WRITE;
                 if page >= pages as u64 || !fits {
                     reply(FB_DISK_ERR_REQUEST, 0);
+                } else if power.off {
+                    reply(FB_DISK_ERR_IO, 0);
                 } else {
+                    let (first, count) = if write { power.admit() } else { (0, PAGE_SECTORS) };
+                    if count == 0 {
+                        reply(FB_DISK_ERR_IO, 0);
+                        continue;
+                    }
                     // Mientras el disco trabaja, la llamada queda aplazada:
                     // así el driver puede esperar la interrupción.
                     let caller = defer_reply();
-                    let write = operation == FB_DISK_OP_WRITE;
-                    let status = transfer(&device, &mut queue, write, sector, data[page as usize]);
-                    reply_to(caller, status);
+                    let address = data[page as usize] + first * SECTOR_BYTES;
+                    let status = transfer(&device, &mut queue, write, sector + first, address, count);
+                    // La escritura cortada no llega entera: para quien
+                    // escribe, es un error.
+                    reply_to(caller, if power.off { FB_DISK_ERR_IO } else { status });
                 }
             }
             _ => reply(FB_DISK_ERR_REQUEST, 0),

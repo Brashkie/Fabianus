@@ -1010,6 +1010,79 @@ fn measureDisk(harts: u64) void {
     }
 }
 
+/// Una medida del sistema de archivos (Hito 35): driver, servidor y cliente
+/// en el hart 0. El cliente (tests/fs_check.rs) formatea, prepara un archivo
+/// y repite la operación; devuelve unidades de reloj o instrucciones.
+fn fsOnce(operation: u64, rounds: u64) u64 {
+    const queue = region.create(1) orelse @panic("benchmark: sin region para la cola");
+    const meta = region.create(abi.FB_FS_META_PAGES) orelse @panic("benchmark: sin region para los metadatos");
+    const data = region.create(4) orelse @panic("benchmark: sin region para los datos");
+    const driver = process.spawnWithOn(0, .disk_driver, 0, &.{
+        endpointGrant(0, 0, recv_right),
+        .{ .slot = 1, .kind = abi.FB_CAP_DEVICE, .object = abi.FB_DEVICE_DISK, .rights = send_right | recv_right },
+        endpointGrant(2, 1, recv_right),
+        regionGrant(3, queue, send_right | recv_right),
+        regionGrant(4, meta, send_right | recv_right),
+        regionGrant(5, data, send_right | recv_right),
+    }) orelse @panic("no se pudo crear el driver");
+    thread.setParams(driver, abi.FB_PRIO_NORMAL, abi.FB_SCHED_MAX_BUDGET);
+    const server = process.spawnWithOn(0, .fs_server, 4, &.{
+        endpointGrant(0, 2, recv_right),
+        endpointGrant(1, 0, send_right),
+        regionGrant(2, meta, send_right | recv_right),
+        regionGrant(3, data, send_right | recv_right),
+    }) orelse @panic("no se pudo crear el servidor de archivos");
+    thread.setParams(server, abi.FB_PRIO_NORMAL, abi.FB_SCHED_MAX_BUDGET);
+    while (thread.state(driver) != abi.FB_THREAD_BLOCKED or thread.state(server) != abi.FB_THREAD_BLOCKED) thread.yield();
+    // El servidor solo atiende a clientes con marca (Hito 39).
+    var client_endpoint = endpointGrant(0, 2, send_right);
+    client_endpoint.badge = 0x39_b000;
+    const client = process.spawnWithOn(0, .fs_check, 0x10 | operation << 8 | rounds << 16, &.{
+        client_endpoint,
+        regionGrant(1, data, send_right | recv_right),
+    }) orelse @panic("no se pudo crear el proceso");
+    thread.setParams(client, abi.FB_PRIO_NORMAL, abi.FB_SCHED_MAX_BUDGET);
+    region.release(queue);
+    region.release(meta);
+    region.release(data);
+    const total = sleepUntilExit(client).value;
+    _ = waitForResult(server);
+    _ = waitForResult(driver);
+    return total;
+}
+
+fn measureFs() void {
+    const cases = [_]struct { operation: u64, rounds: u64, clock: bool, name: []const u8 }{
+        .{ .operation = 1, .rounds = 1024, .clock = true, .name = "abrir y cerrar un nombre (primera entrada), sin disco" },
+        .{ .operation = 2, .rounds = 1024, .clock = true, .name = "abrir y cerrar un nombre (entrada 64 de 64), sin disco" },
+        .{ .operation = 3, .rounds = 128, .clock = false, .name = "leer 4 KiB de un archivo" },
+        .{ .operation = 4, .rounds = 128, .clock = false, .name = "reescribir 4 KiB de un archivo (datos y tabla)" },
+        .{ .operation = 5, .rounds = 64, .clock = false, .name = "crear, borrar y cerrar un archivo (dos escrituras de la tabla)" },
+        .{ .operation = 6, .rounds = 1024, .clock = true, .name = "abrir y cerrar una ruta de 4 nombres (d1/d2/d3/bench), sin disco" },
+        .{ .operation = 7, .rounds = 128, .clock = false, .name = "renombrar entre directorios (una escritura de la tabla)" },
+        .{ .operation = 8, .rounds = 1024, .clock = true, .name = "STAT de un manejador abierto (como fstat), sin disco" },
+    };
+    for (cases) |case| {
+        var runs: [x_repeats]u64 = undefined;
+        for (&runs) |*run_| {
+            const value = fsOnce(case.operation, case.rounds);
+            if (value == 0 or value > (1 << 56)) @panic("la medida del sistema de archivos fallo");
+            run_.* = if (case.clock) value * 100 else value;
+        }
+        const s = sorted(runs);
+        uart.print(case.name);
+        uart.print(": ");
+        uart.printDecimal(s[0] / case.rounds);
+        uart.print(if (case.clock) " ns (minima; mediana " else " instrucciones de toda la maquina (minima; mediana ");
+        uart.printDecimal(s[x_repeats / 2] / case.rounds);
+        uart.print(", maxima ");
+        uart.printDecimal(s[x_repeats - 1] / case.rounds);
+        uart.print(") (5 x ");
+        uart.printDecimal(case.rounds);
+        uart.print(")\n");
+    }
+}
+
 pub fn runSmp(harts: u64) void {
     uart.print("benchmark con ");
     uart.printDecimal(harts);
@@ -1029,5 +1102,6 @@ pub fn runSmp(harts: u64) void {
     measureSharedPass();
     measureRegionMap();
     measureDisk(harts);
+    measureFs();
     thread.setParams(0, abi.FB_PRIO_NORMAL, abi.FB_SCHED_DEFAULT_BUDGET);
 }

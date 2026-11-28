@@ -465,6 +465,151 @@ static void measure_map(void) {
 }
 
 /*
+ * Buscar un nombre sin tocar el disco (Hito 35), como la búsqueda del
+ * servidor de archivos de Fabianus: stat de un archivo del initramfs, que
+ * Linux resuelve en la caché de nombres (dcache). Con un directorio de 2 y de
+ * 64 entradas, como la tabla de Fabianus con 1 y con 64 archivos.
+ */
+#define LOOKUP_ROUNDS 1024
+
+static void measure_lookup_in(const char *directory, int entries, const char *label) {
+    char path[64];
+    mkdir(directory, 0755);
+    for (int i = 0; i < entries; i++) {
+        snprintf(path, sizeof path, "%s/f%02d", directory, i);
+        int fd = open(path, O_CREAT | O_WRONLY, 0644);
+        if (fd < 0) {
+            printf("no se pudo crear %s\n", path);
+            return;
+        }
+        close(fd);
+    }
+    snprintf(path, sizeof path, "%s/f%02d", directory, entries - 1);
+    uint64_t total[REPEATS];
+    struct stat info;
+    for (int i = 0; i < REPEATS; i++) {
+        uint64_t begin = rdtime();
+        for (int round = 0; round < LOOKUP_ROUNDS; round++) {
+            if (stat(path, &info) != 0) {
+                printf("stat fallo\n");
+                return;
+            }
+        }
+        total[i] = rdtime() - begin;
+    }
+    printf("buscar un nombre con stat (%s): ", label);
+    print_spread(total, LOOKUP_ROUNDS);
+    printf(" (%d x %d)\n", REPEATS, LOOKUP_ROUNDS);
+    fflush(stdout);
+}
+
+static void measure_lookup(void) {
+    measure_lookup_in("/fs2", 2, "directorio de 2 entradas");
+    measure_lookup_in("/fs64", 64, "directorio de 64 entradas");
+}
+
+/*
+ * Directorios (Hito 37), como las medidas 6 y 7 del sistema de archivos de
+ * Fabianus: stat de una ruta de 4 nombres (d1/d2/d3/bench), con el reloj, y
+ * renombrar entre directorios (d1/d2/d3/bench <-> d1/bench), contando las
+ * instrucciones de toda la máquina. En Linux todo queda en memoria (initramfs):
+ * renombrar no escribe en el disco, y en Fabianus sí (la tabla).
+ */
+static void measure_directories(void) {
+    mkdir("/d1", 0755);
+    mkdir("/d1/d2", 0755);
+    mkdir("/d1/d2/d3", 0755);
+    int fd = open("/d1/d2/d3/bench", O_CREAT | O_WRONLY, 0644);
+    if (fd < 0) {
+        printf("no se pudo crear /d1/d2/d3/bench\n");
+        return;
+    }
+    close(fd);
+    uint64_t total[REPEATS];
+    struct stat info;
+    for (int i = 0; i < REPEATS; i++) {
+        uint64_t begin = rdtime();
+        for (int round = 0; round < LOOKUP_ROUNDS; round++) {
+            if (stat("/d1/d2/d3/bench", &info) != 0) {
+                printf("stat fallo\n");
+                return;
+            }
+        }
+        total[i] = rdtime() - begin;
+    }
+    printf("buscar una ruta de 4 nombres con stat: ");
+    print_spread(total, LOOKUP_ROUNDS);
+    printf(" (%d x %d)\n", REPEATS, LOOKUP_ROUNDS);
+    for (int i = 0; i < REPEATS; i++) {
+        uint64_t begin = rdtime();
+        for (int round = 0; round < 128; round++) {
+            const char *from = round % 2 == 0 ? "/d1/d2/d3/bench" : "/d1/bench";
+            const char *to = round % 2 == 0 ? "/d1/bench" : "/d1/d2/d3/bench";
+            if (rename(from, to) != 0) {
+                printf("rename fallo\n");
+                return;
+            }
+        }
+        total[i] = rdtime() - begin;
+    }
+    printf("renombrar entre directorios, en memoria: ");
+    print_spread(total, 128);
+    printf(" (%d x 128)\n", REPEATS);
+    fflush(stdout);
+}
+
+/*
+ * Manejadores (Hito 38). Conseguir uno: open + close de una ruta de 1 y de 4
+ * nombres (en Fabianus, LOOKUP, que da el manejador). Usarlo sin tocar el
+ * disco: fstat sobre el descriptor (en Fabianus, una lectura con un
+ * manejador caducado: ida y vuelta al servidor y la comprobación de la
+ * generación).
+ */
+static void measure_handles(void) {
+    const char *paths[2] = {"/fs2/f00", "/d1/d2/d3/bench"};
+    const char *labels[2] = {"1 nombre", "4 nombres"};
+    uint64_t total[REPEATS];
+    for (int which = 0; which < 2; which++) {
+        for (int i = 0; i < REPEATS; i++) {
+            uint64_t begin = rdtime();
+            for (int round = 0; round < LOOKUP_ROUNDS; round++) {
+                int fd = open(paths[which], O_RDONLY);
+                if (fd < 0) {
+                    printf("open de %s fallo\n", paths[which]);
+                    return;
+                }
+                close(fd);
+            }
+            total[i] = rdtime() - begin;
+        }
+        printf("open + close de una ruta de %s: ", labels[which]);
+        print_spread(total, LOOKUP_ROUNDS);
+        printf(" (%d x %d)\n", REPEATS, LOOKUP_ROUNDS);
+    }
+    int fd = open(paths[0], O_RDONLY);
+    if (fd < 0) {
+        printf("open de %s fallo\n", paths[0]);
+        return;
+    }
+    struct stat info;
+    for (int i = 0; i < REPEATS; i++) {
+        uint64_t begin = rdtime();
+        for (int round = 0; round < LOOKUP_ROUNDS; round++) {
+            if (fstat(fd, &info) != 0) {
+                printf("fstat fallo\n");
+                return;
+            }
+        }
+        total[i] = rdtime() - begin;
+    }
+    close(fd);
+    printf("usar un descriptor sin disco (fstat): ");
+    print_spread(total, LOOKUP_ROUNDS);
+    printf(" (%d x %d)\n", REPEATS, LOOKUP_ROUNDS);
+    fflush(stdout);
+}
+
+/*
  * Disco virtio-blk (Hito 34), como benchmark.measureDisk en Fabianus: leer y
  * escribir 4 KiB con O_DIRECT en los sectores 8i mod 2040, contando las
  * instrucciones de toda la máquina (instret, global con -icount). No con el
@@ -594,6 +739,9 @@ int main(void) {
     measure_inversion();
     measure_pass();
     measure_map();
+    measure_lookup();
+    measure_directories();
+    measure_handles();
     if (disk) measure_disk();
 
     printf("fin del benchmark de linux\n");

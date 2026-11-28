@@ -116,10 +116,14 @@ pub const Program = enum(usize) {
     disk_check,
     dma_status,
     bench_disk,
+    fs_server,
+    fs_check,
+    fs_crash,
 };
 
-/// Capability que el kernel concede a un proceso al crearlo.
-pub const Grant = struct { slot: u64, kind: u64, object: u64, rights: u64 };
+/// Capability que el kernel concede a un proceso al crearlo, con su marca
+/// (0 sin marca).
+pub const Grant = struct { slot: u64, kind: u64, object: u64, rights: u64, badge: u64 = 0 };
 
 /// Consola en el hueco 0: la mínima autoridad para imprimir.
 pub const console_grant = [_]Grant{.{
@@ -218,7 +222,7 @@ pub fn spawnWithOn(target: u64, program: Program, argument: u64, grants: []const
     }
 
     for (grants) |grant| {
-        if (abi.fb_cap_grant(space, grant.slot, grant.kind, grant.object, grant.rights) != abi.FB_CAP_OK) {
+        if (abi.fb_cap_grant_badged(space, grant.slot, grant.kind, grant.object, grant.rights, grant.badge) != abi.FB_CAP_OK) {
             @panic("concesion de capability invalida");
         }
     }

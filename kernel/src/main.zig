@@ -23,6 +23,7 @@ const selftest_driver = @import("selftest_driver.zig");
 const selftest_user = @import("selftest_user.zig");
 const selftest_shared = @import("selftest_shared.zig");
 const selftest_disk = @import("selftest_disk.zig");
+const selftest_fs = @import("selftest_fs.zig");
 const thread = @import("thread.zig");
 const trap = @import("trap.zig");
 const uart = @import("uart.zig");
@@ -83,6 +84,15 @@ export fn fb_kmain(hart_id: u64, boot_flags: u64) callconv(.c) noreturn {
     // Los harts secundarios arrancan después de activar la paginación: la
     // necesitan para llegar a su pila y a su código.
     const harts = smp.start(build_options.harts);
+    switch (build_options.fskill) {
+        .none => {},
+        .run => selftest_fs.killLoop(harts),
+        .check => {
+            selftest_fs.killCheck(harts);
+            uart.print("boot: ok\n");
+            platform.poweroffPass();
+        },
+    }
     selftest.run();
     selftest_smp.run(harts);
     selftest_threads.run();
@@ -94,6 +104,7 @@ export fn fb_kmain(hart_id: u64, boot_flags: u64) callconv(.c) noreturn {
     selftest_driver.run();
     selftest_shared.run(harts);
     selftest_disk.run(harts);
+    selftest_fs.run(harts);
     crashIfRequested();
 
     uart.print("boot: ok\n");

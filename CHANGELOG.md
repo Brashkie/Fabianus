@@ -6,7 +6,8 @@ foundation, verification (what is proved and what is only tested) and
 experimental evidence.
 
 - **Languages:** Zig (core), Ada/SPARK (proved parts), assembly, Rust (UART
-  and disk drivers as user processes), C (common ABI and Linux comparison).
+  and disk drivers and the file system server, as user processes), C
+  (common ABI and Linux comparison).
   D and VHDL are decided but not used yet.
 - **License:** GPL-3.0-or-later. Every source file carries the line
   `SPDX-License-Identifier: GPL-3.0-or-later`.
@@ -15,6 +16,616 @@ experimental evidence.
   mandatory gate before compiling.
 
 ---
+
+## Milestone 39 — Handles that belong to one client
+
+- **Goal:** in milestone 38 a handle was the table entry and its
+  generation. Any client that knew both could build a handle without ever
+  looking the file up, and use it. Now a handle is a small number that the
+  file system server gives to one client, like a Linux file descriptor, and
+  that is worth nothing to any other client.
+- **Badges (kernel):** every capability carries a 64-bit badge. Only the
+  kernel sets it, when it grants the capability; deriving and transferring
+  keep it. When a server receives a message, the kernel puts in `a6` the
+  badge of the capability the sender used. So the server knows which client
+  is calling, and a client cannot pretend to be another.
+  - The badge is read when the message is sent, so a sender waiting in the
+    queue keeps the badge it sent with.
+  - User programs that receive messages now treat `a6` as overwritten by
+    `recv`; the UART and disk drivers were updated.
+- **Handles (server):** a new SPARK package, `Fs_Handles`, keeps one row per
+  client badge (4 clients, 16 handles each), with the entry and generation
+  that each open handle names.
+  - `LOOKUP` and `CREATE` open a handle (the lowest free one, as in Linux),
+    `CLOSE` releases it, `DETACH` releases all of a client's handles and its
+    row. `STAT` gives what a handle names: its number (entry and
+    generation), length and kind. `LIST` gives numbers, not handles.
+  - A handle that the client has not opened answers the new error
+    `BAD_HANDLE`, even if another client has it open. A request without a
+    badge answers `DENIED`; no free handle or row, `HANDLES`.
+  - The generation check of milestone 38 still runs on every use: a handle
+    open on something deleted answers `STALE` until it is closed.
+  - `CREATE` first checks that the client can open one more handle (`Room`),
+    so it never creates a file that it then could not hand back.
+  - The root is the handle `FB_FS_ROOT` for every client.
+- **Proved in SPARK:**
+  - `Cap_Core`: `Subsumes` now requires the same badge, so `Covered` (no
+    operation a process can ask for creates authority) also covers badges.
+    `Lemma_Badges_Kept`: after any such operation, every capability carries
+    a badge that some capability already had.
+  - `Fs_Handles`: `Resolve` answers only what the same badge has open in
+    that handle (`Holds`). Every operation is a step `Only_Client`: it
+    changes only the row of the badge that asks, or a free row that becomes
+    its own. `Lemma_Only_Owner`: in any history of such steps, if a client
+    ends up holding something in a handle that it did not hold there at the
+    start, one of the steps was a request with its badge. `Open` gives the
+    lowest free handle and succeeds whenever `Room` says so.
+  - `Fs_Core.Stat` answers only for a valid entry and generation.
+- **Tests:**
+  - kernel: badges are kept by derive and transfer and cleared with the
+    capability;
+  - kernel: 4000 random requests to `Fs_Handles` from six clients (five
+    badges, one of them the highest, and one without a badge), checked after
+    each step against a model of what each client has open, with
+    `Only_Client` and the table invariant checked by hand; then a client
+    with its 16 handles open and a fifth client without a row;
+  - through the server, one process acts as five clients and one without a
+    badge (several capabilities to the same endpoint): a second
+    client cannot read, write, delete, rename, list, stat or close with
+    any handle of the first, even with the same number; each client's
+    handle 0 is its own; the unbadged capability is `DENIED` for everything,
+    including `FORMAT` and `STOP`; with 16 handles open, `LOOKUP` and
+    `CREATE` answer `HANDLES` and nothing is created; a fifth client waits
+    until another one sends `DETACH`, which closes only that client's
+    handles; a handle open on a file that another client deletes answers
+    `STALE` until it is closed;
+  - the earlier tests now open and close their handles; a new server has
+    no handle open; formatting makes an open handle stale;
+  - power cuts: the model now checks the number (entry and generation) of
+    every object with `STAT`. Open handles do not survive the server, so
+    the check of milestone 38 on handles of deleted objects is replaced by
+    this one: an object created in a reused entry must have the next
+    generation. 467 cuts
+    per boot: 320 left the state before the operation and 147 the state
+    after.
+- **Measurements** (`-icount`, 4 harts, median of 5 runs; Linux 6.12 in the
+  same QEMU, files in the initramfs):
+
+  | Operation | Fabianus | Linux |
+  |---|---|---|
+  | Open and close, path of one name | 6667 ns (`LOOKUP` + `CLOSE`) | 7873 ns (`open` + `close`) |
+  | Open and close, path of 4 names | 8503 ns (`LOOKUP` + `CLOSE`) | 8804 ns (`open` + `close`) |
+  | Use a handle without the disk | 2785 ns (`STAT`) | 1661 ns (`fstat`) |
+
+  - Opening now keeps state, as in Linux, so it costs two round trips to
+    the server (`LOOKUP` and `CLOSE`) instead of one: one name went from
+    3891 to 6667 ns, 4 names from 5674 to 8503 ns. Both are still a little
+    cheaper than Linux's `open` + `close` (15% and 3%).
+  - `STAT` is one round trip plus finding the client's row: 2785 ns, 1.7
+    times Linux's `fstat`, which does not leave the process. In milestone
+    38 the same round trip with a stale handle cost 2700 ns.
+  - Operations that touch the disk did not get slower: reading 4 KiB 8327
+    instructions (8781 in milestone 38), rewriting 4 KiB 14011 (14161),
+    renaming across directories 13266 (13585). Creating and deleting now
+    also closes the handle: 21247 instructions (19414 without the close).
+
+- **Verification:**
+  - full proof from scratch with nothing pending: 2918 checks
+    (2779 in milestone 38);
+  - 147 self-tests (two new) with 1 and 4 harts, in Debug and optimized
+    builds, and with `-icount`;
+  - real kills: 400 QEMU kills at random moments (18,940 complete rounds
+    of the workload before them): all 400 disks were in a state of the
+    workload, and all 22 states appeared. The check now compares the number
+    of every object with `STAT`;
+  - stress: 4 QEMU at once, 12 rounds with 1 hart and 12 with 4 harts:
+    48 of 48 with 4 harts, 46 of 48 with 1 hart, and 47 of 48 when repeated.
+    All three failures were the CPU share test (3 to 1 asked, ratio between
+    2 and 4 required), with ratios of 1.83 to 1.92: it measures with the
+    host's clock, and the host was running other heavy programs. With them
+    closed, alternating rounds of the milestone 38 and 39 kernels passed 48
+    of 48 each, with the same ratios (median 2.96 and 2.97, lowest 2.48 and
+    2.33). The scheduler did not change in this milestone.
+- **Mutations:**
+  - runtime: 57 of 57 caught. New: the kernel not delivering the
+    badge, or reading it from another slot; deriving that loses the badge;
+    the server serving requests without a badge, or mixing up similar
+    badges; creating without checking `Room`; `DETACH` that closes nothing;
+    `Resolve`, `Close` and `Detach` using another client's row; `Open`
+    taking another client's row or not giving the lowest free handle;
+    closing that does not close; `Resolve` without checking that the handle
+    is open; `Room` always saying yes; and `STAT` without checking the
+    generation. The 41 of milestones 35-38 again.
+  - SPARK: 13 of 13 new ones rejected by the proof: `Derive`,
+    `Transfer` and `Grant_Badged` losing the badge, `Badge_Of` reading
+    another slot, and the 9 mutations of `Fs_Handles` and `Stat` listed
+    above. The 39 of milestones 35-38 were not run again: their contracts
+    did not change, and the only addition to `Fs_Core` is `Stat`.
+  - regression: the 9 of milestone 34 (disk driver, DMA, PMP) caught again.
+- **Limits:**
+  - A client that dies without `DETACH` keeps its row until the server
+    stops: the kernel does not tell the server. With 4 rows, a fifth client
+    waits for one to be released.
+  - Badges are given by the kernel when it creates a process; no process
+    can mint badged capabilities for others yet.
+  - Two capabilities with the same badge are the same client for the
+    server, wherever they are.
+  - Handle numbers are reused after `CLOSE`, as Linux reuses descriptors.
+
+## Milestone 38 — Handles that never point to the wrong file
+
+- **Goal:** until now, a client named a file by its table entry. Another
+  client could delete that file and create a new one in the same entry, and
+  the first client's next write would land in the new file. Now every file
+  and directory is named by a handle that stops working, for good, when what
+  it named is deleted.
+- **Design:** each table entry gains a 32-bit generation. Deleting an entry
+  raises its generation in the same 64-byte write that frees it, so the
+  power-cut argument of milestone 36 still holds. Creating reuses a free
+  entry with the generation it already has. A handle is the entry and the
+  generation in one word (`gen << 8 | entry`). Every operation that takes a
+  handle answers the new error `STALE` if the entry is no longer in use with
+  that generation. Renaming keeps the generation, so a handle survives a
+  rename, as a Linux file descriptor does. To make room, names shrink from
+  24 to 20 bytes (format version 3).
+  - **Retirement:** an entry whose generation reaches 2^32 - 1 is never used
+    again, so a generation never wraps around.
+  - **Formatting** a disk that already held a file system raises every
+    generation by one: no handle from before the format works after it.
+- **Proved in SPARK (`Fs_Core`):**
+  - `Step_Ok(Old, New)`: no generation goes down, and an entry in use can
+    only stop being in use, or change kind, if its generation goes up. Every
+    operation that changes the table has it in its postcondition.
+  - `Lemma_Same_Object`: in any history of tables where each step is
+    `Step_Ok`, a handle that is valid at the first and at the last table was
+    valid at every table in between, with the same kind. So it names the same
+    object, which was never deleted in between. A handle of a deleted object
+    can never become valid again.
+  - Every operation on a handle succeeds only if the handle is valid
+    (`Opened`). `Delete` raises the generation by exactly one, `Rename` and
+    `Commit_Write` keep it, `Create` never uses a retired entry, `Mount`
+    rejects an entry in use with the last generation, and `Format` raises
+    every generation (or keeps a retired one retired).
+- **Server:** `LOOKUP`, `CREATE` and `LIST` answer handles; `READ`, `WRITE`,
+  `DELETE`, `RENAME` and `LIST` take them. The root is the handle
+  `FB_FS_ROOT`.
+- **Tests:**
+  - the kernel's random sequence of 800 operations now uses a wrong
+    generation one time in sixteen; each such request is refused with
+    `STALE` and leaves the table unchanged. After every step it checks `Step_Ok` by hand between the
+    table before and after, and that none of the last 32 deleted handles
+    works again;
+  - a new kernel test: an entry is reused without the old handle working,
+    rename keeps the handle, an entry reaches the last generation and is
+    never reused (the table fills up without it), `Mount` rejects an entry in
+    use with the last generation (27 kinds of bad table), and formatting
+    raises every generation or starts them at 0;
+  - through the server: a deleted file whose entry was reused by another
+    file answers `STALE` to read, write, delete, rename and list, and does
+    not read the other file's data; forged handles (next generation, high
+    bits) are refused; a deleted directory's handle cannot list; a handle
+    survives a rename into another directory; formatting a mounted disk
+    makes the old handle of "hello" stale;
+  - **power cuts:** the model behind the test now also knows which entry
+    each object takes and every entry's generation. After every cut, the
+    disk must give each object exactly the handle the model predicts, and
+    the handles of deleted objects must answer `STALE`, even where another
+    object took their entry. This checks that the raised generation reaches
+    the disk together with the delete. 467 cuts per boot: 320 left the state
+    before the operation and 147 the state after it.
+- **Measurements** (`-icount`, 4 harts, median of 5 runs; Linux 6.12 in the
+  same QEMU, files in the initramfs):
+
+  | Operation | Fabianus | Linux |
+  |---|---|---|
+  | Get a handle, path of one name | 3891 ns (`LOOKUP`) | 7873 ns (`open` + `close`) |
+  | Get a handle, path of 4 names | 5674 ns (`LOOKUP`) | 8804 ns (`open` + `close`) |
+  | Use a handle without the disk | 2700 ns (a stale handle, refused) | 1661 ns (`fstat`) |
+  | Look up a path of 4 names | 5674 ns | 5915 ns (`stat`) |
+
+  - Using a handle costs one round trip to the server plus the generation
+    check; Linux's `fstat` is one system call into the same process's
+    descriptor table, 1.6 times faster.
+  - Getting a handle is cheaper than in Linux, which allocates and frees a
+    descriptor on `open` and `close`; Fabianus gives out a number and keeps
+    no state per handle.
+  - Looking up 4 names went from 5985 to 5674 ns. Names are now 20 bytes
+    instead of 24, so each comparison is shorter; this was not profiled.
+  - Operations that touch the disk cost slightly more than in milestone 37:
+    reading 4 KiB 8781 instructions (+4.4%), rewriting 4 KiB 14161 (+1.0%),
+    creating and deleting 19414 (+4.6%), renaming across directories 13585
+    (+1.9%).
+- **Verification:**
+  - full proof from scratch with nothing pending: 2779 checks (2694
+    in milestone 37);
+  - 145 self-tests (one new) with 1 and 4 harts, in Debug and optimized
+    builds, and with `-icount`;
+  - real kills: 400 QEMU kills at random moments (53,412 complete rounds
+    of the workload before them): all 400 disks were in a state of the
+    workload, and all 22 states appeared. The check now also compares every
+    handle with the model;
+  - stress: 4 QEMU at once, 12 rounds with 1 hart and 12 with 4 harts: 96
+    of 96 boots passed.
+- **Mutations:**
+  - runtime: 41 of 41 caught. New: deleting without raising the generation,
+    reading, planning a write, deleting, renaming or listing without
+    checking the generation, creating in a retired entry or with generation
+    0, renaming that changes the generation, `Mount` accepting the last
+    generation in use, formatting without keeping the generations, the
+    server giving handles without the generation, and deleting with the
+    table's generation instead of the handle's. The 28 of milestones 35-37
+    again.
+  - SPARK: 39 of 39 rejected by the proof. New: deleting without raising
+    the generation; `Block_Of`, `Plan_Write`, `Delete`, `Rename` and
+    `Next_In` without checking the generation; creating in a retired entry
+    or with generation 0; renaming that changes the generation; `Mount`
+    accepting the last generation in use; `Step_Ok` without requiring the
+    entry to stay in use; `Format` without raising the generations; and
+    `Delete` that keeps the entry. The 26 of milestones 35-37 again, against
+    the new specification.
+  - regression: the 9 of milestone 34 (disk driver, DMA, PMP) caught again.
+- **Limits:**
+  - A handle is not a capability: a client that knows an entry and its
+    generation can build a handle without having looked the file up. Unlike
+    a Linux descriptor, handles are not per process, and nothing is closed.
+  - Formatting a disk whose superblock is not valid starts every generation
+    at 0, so a handle given out by an earlier file system on that disk could
+    match again.
+  - Names are 20 bytes at most (24 before).
+  - Entries are still 64 in all, and lookup scans the table linearly.
+
+## Milestone 37 — Directories, and rename across them
+
+- **Goal:** files live in a tree of directories, reached by paths such as
+  `/docs/notes/a`. Entries can be renamed and moved from one directory to
+  another. Every operation stays atomic under a power cut, and the tree can
+  never contain a cycle.
+- **Design:** each table entry now records its kind (file or directory) and
+  the directory that contains it (another entry, or the root, which has no
+  entry). A directory has no blocks: its children are the entries that name
+  it as their parent. So creating, deleting and renaming, even from one
+  directory to another, still change a single 64-byte entry inside a single
+  sector, and the power-cut argument of milestone 36 carries over unchanged.
+  The entry layout changed (format version 2).
+- **Proved in SPARK (`Fs_Core`):**
+  - **No cycles.** The server keeps, next to the block map, the depth of
+    every entry: 1 under the root, and one more than its directory below
+    it. Like the block map, it is not on disk: `Mount` computes it from the
+    table and rejects the disk as corrupted if it cannot (a cycle).
+    `Lemma_No_Cycle` proves that climbing from directory to directory never
+    returns to the starting entry: the depth goes down by exactly one at
+    each step, and a natural number cannot go down forever.
+  - **Rename** changes only the directory and the name of one entry, and
+    recomputes every depth from scratch (`Rank_All`). If they cannot be
+    computed, because a directory would end up inside itself or inside one
+    of its descendants, the entry is restored and the request is refused.
+  - **Names are unique per directory**, a directory only holds entries while
+    it exists and is a directory, a directory is only deleted when empty, and
+    files and directories cannot be confused (no blocks for a directory, no
+    children for a file).
+  - **Names** are 1 to 24 bytes, without `/` and not `.` or `..`, padded with
+    zeros so that each name has one spelling. `Mount` rejects anything else.
+- **Server:** paths travel at the start of a page of the client's region.
+  The server copies them, splits them into names and resolves them one
+  name at a time with the proved `Lookup`. New operation `RENAME`; `LIST`
+  now lists one directory; new errors for "not a directory", "directory not
+  empty" and "is a directory".
+- **Tests:**
+  - the random sequence of the kernel self-test now creates directories and
+    renames (800 operations). After each step it remounts the table and
+    checks that the depths the core keeps are the ones it deduces from the
+    table, and, by hand, that every entry hangs from the root;
+  - `Mount` rejects 26 kinds of bad tables (14 before), among them a file
+    used as a directory, a missing directory, a directory inside itself, two
+    directories inside each other, a cycle away from the root, and names
+    with `/`, `.`, `..` or bytes after their end;
+  - in the core: a directory never ends up inside itself, a refused rename
+    leaves the table byte for byte unchanged, and a successful one changes
+    one entry;
+  - through the server: paths with repeated slashes, errors for every bad
+    path, listing a directory, moving a file with its data, moving a
+    directory with everything under it, a chain of 30 nested directories;
+  - **power cuts:** the workload grows from 16 to 21 operations. It now
+    creates directories, moves a file into another directory under a new
+    name, moves a directory that holds files to the root, and deletes an
+    empty directory. The model behind the test checks each directory's
+    exact contents. 467 cuts per boot: 320 left the state before the
+    operation and 147 the state after it.
+- **Measurements** (`-icount`, 4 harts, median of 5 runs; Linux 6.12 in the
+  same QEMU, files in the initramfs):
+
+  | Operation | Fabianus | Linux |
+  |---|---|---|
+  | Look up one name | 3967 ns | 4917 ns (`stat`) |
+  | Look up a path of 4 names | 5985 ns | 5777 ns (`stat`) |
+  | Rename across directories | 13337 instructions, with a table write to disk | 15374 ns, in memory only |
+
+  - Looking up one name costs 1075 ns more than in milestone 35 (2892 ns),
+    which carried the name in the message registers; now the path is in
+    shared memory. Splitting the path by hand instead of with iterators
+    saved 130 ns over 4 names; most of the cost is elsewhere and was not
+    profiled.
+  - Linux resolves a longer path faster: each extra name costs Fabianus
+    about 670 ns, against about 290 ns for Linux's name cache.
+  - Creating and deleting a file costs 18555 instructions, 9% more than in
+    milestone 36 (17009): creating now goes through a path. Reading (8412)
+    and rewriting (14014) 4 KiB of a file cost 2% and 0.2% more.
+- **Verification:**
+  - full proof from scratch with nothing pending: 2694 checks (2485 in
+    milestone 36);
+  - 144 self-tests (one new) with 1 and 4 harts, in Debug and optimized
+    builds, and with `-icount`; a boot takes about 20 s alone with 1 hart
+    (17 s in milestone 36), mostly from the larger power-cut test.
+- **Real kills:** 400 QEMU kills at random moments of the looping
+  workload (16,757 complete rounds before the kills): all 400 disks were in
+  a state of the workload, and all 22 states appeared.
+- **Stress:** 4 QEMU at once, 12 rounds with 1 hart and 12 with 4 harts:
+  96 of 96 boots passed.
+- **Mutations:**
+  - runtime: 28 of 28 caught. New: rename without writing the table (caught
+    by the power-cut test), creating only files, resolving a path without
+    going down, the server accepting `.` and `..`, names allowed to contain
+    `/`, listing or looking up without looking at the directory, rename
+    without recomputing depths, deleting a directory that is not empty, and
+    `Mount` without depths, without checking directories, or comparing
+    names across directories. The 16 of milestones 35-36 again.
+  - SPARK: 26 of 26 rejected by the prover. New: rename without
+    recomputing depths, without checking the target directory or without
+    restoring the entry when it fails; deleting a directory that is not
+    empty; creating without checking the name or the directory, or with the
+    depth of the directory itself; `Mount` without checking directories or
+    depths; lookup without looking at the directory; `Rank_All` without
+    requiring the depth of the parent; `Names_Unique` and `Depth_Ok`
+    weakened. The 13 of milestones 35-36 again.
+  - regression: the 9 of milestone 34 (disk driver, DMA, PMP) caught again.
+- **Limits:**
+  - **Rename does not replace** an existing entry (it answers "exists", like
+    `renameat2` with `RENAME_NOREPLACE`). Replacing would change two entries,
+    which can lie in different sectors.
+  - Entries are still 64 in all (files and directories together), and
+    lookup scans the table linearly.
+  - Operations other than lookup and rename still take an entry number,
+    not a path, so another client can delete and reuse an entry between a
+    lookup and a write.
+  - No `.` or `..` in paths: every path starts at the root.
+
+## Milestone 36 — Every file system operation survives a power cut
+
+- **Goal:** after a power cut at any moment, the disk holds either the state
+  before the interrupted operation or the state after it. It is never
+  corrupted, never shows half a file, and never shows data of a deleted
+  file. Milestone 35 argued this for its write order; this milestone
+  changes what was needed, proves the part that can be proved, and tests the
+  rest by cutting the power thousands of times.
+- **Why each operation is atomic:**
+  - **Copy on write.** Rewriting a block of a file now writes the new data
+    into a free block, and only then points the table at it. The old block
+    becomes free. Before, a rewrite went to the same block, and a cut in
+    the middle left a block that was half old and half new.
+  - **Order.** Data reaches the disk before the table that names it, and
+    the table before the superblock when formatting.
+  - **One sector.** Every operation changes a single 64-byte table entry,
+    and an entry never crosses a 512-byte sector. The disk writes a sector
+    whole or not at all, so the table on disk is the old one or the new
+    one, whichever part of the 4 KiB table write was cut.
+- **Proved in SPARK (`Fs_Core`):**
+  - **`Plan_Write` always picks a free block, and no file in the table
+    names it** (`Not_In_Table`, defined from the table alone). Writing the
+    data therefore changes no file that a mount of the old table would see.
+  - **`Commit_Write`** changes only the entry of the file, and in it only
+    the length and the block of that position. The old block becomes free
+    and the table stays valid (`Lemma_Free_Unnamed`).
+  - **`Mount`** now tells three cases apart: a valid file system, a disk
+    without one (no valid superblock), and a corrupted one (a valid
+    superblock with an invalid table). A cut may leave the second, never
+    the third.
+- **Server:** if a table write fails, the table in memory no longer matches
+  the disk. The server then answers every request with an I/O error until
+  another server mounts the disk. In milestone 35 it went on, and a later
+  write could reuse a block that the disk still gave to a deleted file.
+- **Driver:** a fault injection operation, like dm-flakey in Linux. `CUT`
+  lets a given number of sectors through and then "cuts the power". The
+  write that crosses the limit really reaches the disk, with only its first
+  sectors (or, in a second pass, only its last ones). From then on every
+  request fails without touching the disk, until `POWER`.
+- **Crash test** (`tests/fs_crash.rs`, on every boot): a fixed workload of
+  16 operations runs from a disk with garbage in its superblock and table:
+  format, create, write, extend, rewrite, delete, and a new file that
+  reuses the entry and a block of a deleted one. The power is cut after
+  0, 1, 2... sectors, at every one of the 208 sectors it writes (26 writes of 8 sectors),
+  tearing the write in two ways. After each cut a new server mounts the
+  disk and a client checks that it is in the state before or after the
+  interrupted operation: the files, their lengths, the data of every block,
+  the free blocks, and nothing more.
+  - 392 cuts per boot: 280 left the state before the operation and 112
+    the state after it.
+  - Also a passing error: the table write of a delete fails and the power
+    comes back. The server must stop serving, and a new server must find
+    the file with its data.
+- **Real kills** (`-Dfskill=run` and `-Dfskill=check`): QEMU runs the same
+  workload in a loop on a disk image without snapshot and is killed from
+  the host at a random moment. QEMU then boots again on that image and
+  checks that the disk is in one of the states of the workload. A host
+  kill cuts between whole requests, not inside them: it complements the
+  sector-level test above.
+  - 1000 kills: all 1000 disks were in a state of the workload, and all 17
+    states (from "unformatted" to the end) appeared.
+  - An earlier batch of 500 had 1 failure: the second kill, right after
+    the previous batch was stopped while its checking QEMU still had the
+    same image open. The image was not kept, so the cause is not known.
+    The script now keeps the image of any failure; it did not happen again
+    in the 1000 kills above.
+- **Measurements** (`-icount`, 4 harts, median of 5 runs):
+  - rewriting 4 KiB of a file with copy on write: 13986 instructions
+    (milestone 35, in place: 13892, so +0.7%). Both write the data block
+    and the table; copy on write only adds the search for a free block;
+  - the other file system figures are unchanged (lookup 2892 and 4026 ns,
+    read 8246, create and delete 17009 instructions);
+  - the crash test takes part of a boot of about 15 s (1 hart) or 17 s
+    (4 harts) with 392 cuts, each with two servers and two clients.
+- **Verification:**
+  - full proof from scratch with nothing pending: 2485 checks (2461 in
+    milestone 35);
+  - 143 self-tests with 1 and 4 harts, in Debug and optimized builds, and
+    with `-icount`;
+  - stress with 4 QEMU instances at once: 128 of 128 with 1 hart and 191 of 192 with 4 harts. The failure is the known cross-hart inheritance test under load (about 1 in 384 since milestones 31-32), not the file system.
+- **Mutations:**
+  - SPARK: 13 of 13 rejected. New: `Plan_Write` rewriting in place,
+    `Write_Allowed` without requiring a free block (caught by
+    `Not_In_Table`, which only looks at the table), `Commit_Write` without
+    freeing the old block, and `Mount` taking a bad table for an
+    unformatted disk. The 9 of milestone 35 again.
+  - Runtime: 16 of 16 caught, including the **two survivors of milestone
+    35** (the table before the data, the superblock before the table): the
+    crash test catches both. Also rewriting in place (caught by the crash
+    test alone when the other checks are switched off), the server going on
+    after a failed table write, a driver cut that does not cut, a cut write
+    reported as good, and a bad table taken for an unformatted disk.
+  - Milestone 34 again: 9 of 9.
+- **Limits:**
+  - **Rewriting needs a free block:** with the disk full, rewriting a block
+    answers "full", as in other copy-on-write file systems.
+  - **Sector atomicity is assumed:** the test cuts between sectors, not
+    inside one. Real disks guarantee atomic writes only of their own sector
+    size.
+  - **No cache flush:** the driver does not negotiate `VIRTIO_BLK_F_FLUSH`.
+    QEMU then treats the disk as write-through, so the order of completed
+    writes is the order on the disk. A real disk with a volatile write cache
+    needs flushes between data and table.
+  - **No Linux figure:** comparing the write cost with ext4 needs an ext4
+    image, and neither `mke2fs` nor ext4 (a module in the Debian kernel) is
+    available in the comparison setup yet.
+  - The workload is fixed, with four files; the random sequences of
+    milestone 35 are not cut.
+
+## Milestone 35 — A minimal file system, with its core proved in SPARK
+
+- **Goal:** files on the disk. A file system server runs as a user process
+  between clients and the disk driver. Every decision about the on-disk
+  format is taken by a SPARK package that is proved and linked into that
+  same server, so the code that runs is the code that was proved.
+- **Format** (the second MiB of the disk, 256 blocks of 4 KiB):
+  - block 0: superblock (magic number, version, block and file counts);
+  - block 1: a table of 64 entries of 64 bytes. Each entry has a name of up
+    to 24 bytes, a length in bytes and up to 16 blocks (64 KiB per file);
+  - blocks 2 to 255: data.
+  - There is no block bitmap on disk. The in-memory map of who owns each
+    block is derived from the table when mounting, so the two can never
+    disagree.
+- **Proved in SPARK (`Fs_Core`, 221 checks):**
+  - **`Lemma_Disjoint`:** with a valid table, no block belongs to two files,
+    none appears twice in the same file, and none is a metadata block. No
+    two files have the same name.
+  - **`Mount`** accepts a superblock and table read from disk only if they
+    are valid, and builds the map. Anything else is rejected: the disk can
+    hold any bit pattern.
+  - **`Create`, `Commit_Write` and `Delete`** keep the table valid, and say
+    exactly what they change. `Lookup`, `Block_Of`, `Plan_Write` and
+    `Next_Used` are proved to answer correctly.
+  - Every argument that comes from a client is checked inside the proved
+    code and answered with a status.
+  - The functions that describe one entry take only that entry. With the
+    whole table as argument, the provers could not see that changing one
+    entry leaves the others alone, and the first proof attempt timed out.
+- **Server (`servers/fs/main.rs`, Rust, `no_std`, no global data):**
+  - It links the SPARK library directly. The table and the superblock live
+    in a region it shares only with the disk driver; the block map lives on
+    its stack.
+  - **Write order:** data goes to the disk before the table that names it,
+    and the empty table before the superblock when formatting. The table on
+    disk never names a block that was not written, and every new block is
+    written whole by its client, so a file never shows data left by a
+    deleted one.
+  - Protocol (`FB_FS_*`): format, create, lookup, read, write (one block per
+    call), delete, list, free blocks and stop. File data moves by DMA
+    straight between the disk and the client's region: the driver now
+    accepts a second data region (slot 5), numbered after the first.
+  - An unformatted or corrupted disk is reported as such; only format is
+    then accepted.
+- **Kernel:** `memcmp` in `mem.S` (GNAT uses it to compare names). A small
+  shared Rust library for user programs (`lib/fb_user`). The test disk grows
+  to 2 MiB: the first MiB keeps the milestone 34 pattern.
+- **Measurements** (`-icount`, 4 harts, driver, server and client on the
+  same hart; median of 5 runs):
+
+  | Operation | Fabianus | Linux 6.12 |
+  |---|---|---|
+  | Look up a name, no disk (first entry) | 2892 ns | 4910 ns (`stat`, directory of 2) |
+  | Look up a name, no disk (entry 64 of 64) | 4026 ns | 4927 ns (`stat`, directory of 64) |
+  | Read 4 KiB of a file | 8191 instructions | — |
+  | Rewrite 4 KiB of a file (data and table) | 13785 instructions | — |
+  | Create and delete a file (two table writes) | 16913 instructions | — |
+
+  - Fabianus looks up a name with a linear scan of 64 entries, through an
+    IPC call to the server: about 18 ns more per entry. Linux resolves the
+    path in its hashed name cache, so its cost does not depend on the size
+    of the directory. With 64 files the scan is still cheaper than `stat`.
+    With thousands of files it would not be.
+  - A read through the file system costs about 3,000 instructions more than
+    a raw disk read in the same run (5194): one more IPC hop and the proved
+    block lookup.
+  - There is no Linux figure for operations that wait for the disk:
+    `instret` does not advance from user mode in this setup (milestone 34).
+- **New tests** (5):
+  - format and mount an empty file system;
+  - 400 random create, write and delete operations of the SPARK core,
+    followed by filling the disk. After every step the table is mounted from
+    scratch: the map kept step by step is the one derived from the table,
+    no block repeats (checked by hand, without the core) and the free count
+    matches;
+  - mounting rejects 14 kinds of invalid table or superblock (a block in two
+    files or twice in one, metadata or out-of-range blocks, impossible
+    lengths, a block after the last one, an unknown used mark, repeated or
+    empty names, another magic number, version or size) and accepts garbage
+    in free entries;
+  - committing a write rejects blocks owned by others, metadata blocks,
+    changed blocks and holes;
+  - end to end, with the Rust server and driver: on the unformatted disk,
+    format, create, write and read back, limits, rewrite, a file of 16
+    blocks, list, delete, fill the table (64 files) and the disk (250
+    blocks). Then three more servers, one after another and with nothing in
+    memory, mount the same disk. The second finds the data and the empty
+    file created last, and deletes it; the third finds it gone and, as its
+    last operation, extends a file; the fourth sees the new length. Each
+    pass ends on an operation whose table write nothing else would redo, so
+    a server that skipped it is caught. At the end everything stops, the
+    disk is reset and every frame comes back.
+- **Verification:**
+  - full proof from scratch with nothing pending: 2461 checks (2240 in
+    milestone 34);
+  - 142 self-tests with 1 and 4 harts, in Debug and optimized builds;
+  - stress with 4 QEMU instances at once: 128 of 128 with 1 hart and 192 of
+    192 with 4 harts;
+  - the other measures are unchanged (call and reply on 1 hart 1989 ns,
+    raw 4 KiB disk read 5194 instructions).
+- **Mutations:**
+  - SPARK: 9 of 9 rejected (mounting without the ownership check, without
+    validating entries or without comparing names; `Plan_Write` without
+    looking for a free block; `Commit_Write` without checking the plan;
+    `Delete` without freeing blocks; `Create` without looking up the name;
+    `Block_Of` without capping the bytes; and `Count_Of` rounding down,
+    which changes specification and code together and is caught by the
+    lemma that says what the count means).
+  - Runtime: 8 of 10 (reading without checking the client's page, writing,
+    creating or deleting without writing the table, treating any disk as
+    mounted, listing without the name, the driver without its second region,
+    and `memcmp` always equal). The first round left "write without writing
+    the table" alive: a later operation wrote the table and hid it. The test
+    now ends each pass on the operation it checks.
+  - **Survivors:** writing the table before the data, and the superblock
+    before the table. They only matter if the power fails in between, and
+    no test does that (see limits).
+  - Milestone 34 again, with the driver's second region: 9 of 9.
+- **Limits:**
+  - **No directories,** 64 files of at most 64 KiB, and the file system uses
+    a fixed 1 MiB of the disk.
+  - **No cache:** every read goes to the disk.
+  - **One client** and one request at a time.
+  - **Crashes:** the write order keeps the table on disk consistent if
+    sector writes are atomic, but it is argued, not tested: no test cuts the
+    power in the middle of a write. If writing the table fails after a
+    commit, memory and disk disagree until the next table write.
+  - A file id is the index of its entry, and can be reused after a delete.
 
 ## Milestone 34 — A disk driver in Rust, with DMA into shared memory
 

@@ -25,19 +25,142 @@
    una región de datos y le llama: a1 = operación, a2 = primer sector, a3 =
    página de la región. Cada lectura o escritura mueve una página (8 sectores
    de 512 bytes). Contesta en a1 un FB_DISK_* y, para CAPACITY, en a2 el número
-   de sectores. Con STOP contesta y termina. */
+   de sectores. Con STOP contesta y termina.
+   Para las pruebas de cortes de luz (inyección de fallos, como dm-flakey en
+   Linux): CUT con a2 = sectores y a3 = FB_DISK_TEAR_* deja escribir esos
+   sectores más y entonces «se va la luz». La escritura que cruza el límite
+   solo escribe una parte (los primeros sectores o los últimos), y desde ahí
+   toda lectura o escritura contesta FB_DISK_ERR_IO sin tocar el disco.
+   POWER vuelve a dar la luz. */
 #define FB_DISK_OP_STOP 0
 #define FB_DISK_OP_READ 1
 #define FB_DISK_OP_WRITE 2
 #define FB_DISK_OP_CAPACITY 3
+#define FB_DISK_OP_CUT 4
+#define FB_DISK_OP_POWER 5
+#define FB_DISK_TEAR_FIRST 0
+#define FB_DISK_TEAR_LAST 1
 #define FB_DISK_OK 0
 #define FB_DISK_ERR_REQUEST 1
 #define FB_DISK_ERR_IO 2
 #define FB_DISK_SECTOR_BYTES 512
 #define FB_DISK_SECTORS_PER_PAGE 8
-/* Donde el driver mapea su cola (una página) y la región de datos. */
+/* Donde el driver mapea su cola (una página) y la región de datos. Puede
+   recibir una segunda región de datos, que mapea en FB_DISK_EXTRA_BASE: sus
+   páginas siguen, en la numeración, a las de la primera. */
 #define FB_DISK_QUEUE_BASE 0x104000000
 #define FB_DISK_DATA_BASE 0x104010000
+#define FB_DISK_EXTRA_BASE 0x104020000
+#define FB_DISK_MAX_DATA_PAGES 32
+
+/* Sistema de archivos (servers/fs, con su núcleo demostrado en
+   spark/src/fs_core.ads). Es un servidor de usuario entre los clientes y el
+   driver del disco, y ocupa FB_FS_BLOCKS bloques de 4 KiB desde el sector
+   FB_FS_FIRST_SECTOR. Comparte con el driver una región de FB_FS_META_PAGES
+   páginas (superbloque y tabla) y con el cliente y el driver la región de
+   datos del cliente: el disco lee y escribe en ella sin copias.
+   Cada entrada es un archivo o un directorio (FB_FS_KIND_*). Las rutas van
+   al principio de una página de la región del cliente, con a lo sumo
+   FB_FS_PATH_BYTES bytes: nombres separados por '/', desde la raíz. Cada
+   nombre tiene de 1 a FB_FS_NAME_BYTES bytes, sin ceros, y no es "." ni "..".
+   Cada archivo o directorio tiene un número: su entrada en los
+   FB_FS_HANDLE_SHIFT bits bajos y la generación de la entrada encima.
+   Borrar sube la generación, así que el número de algo borrado no vuelve a
+   nombrar nada, aunque otro archivo ocupe su entrada; renombrar no la
+   cambia. La raíz es FB_FS_ROOT.
+   Manejadores (Hito 39). El servidor sabe qué cliente le llama por la marca
+   de su capability (a6 al recibir), y guarda para cada uno los manejadores
+   que tiene abiertos: números de 0 a FB_FS_MAX_OPEN - 1, como descriptores
+   de archivo. LOOKUP y CREATE abren uno; CLOSE lo suelta. Un manejador que
+   el cliente no tiene abierto contesta FB_FS_ERR_BAD_HANDLE, aunque otro
+   cliente sí lo tenga; uno abierto sobre algo borrado (o tras FORMAT),
+   FB_FS_ERR_STALE hasta que lo cierre. FB_FS_ROOT es un manejador de la
+   raíz que vale para todos y no se abre ni se cierra. Sin marca, todo
+   contesta FB_FS_ERR_DENIED. Caben FB_FS_CLIENTS clientes a la vez.
+   Un cliente le llama con a1 = operación:
+     FORMAT: deja el sistema de archivos vacío. Ningún manejador de antes
+       vale después (contestan FB_FS_ERR_STALE).
+     LOOKUP: a2 = página de la ruta, a3 = su longitud. Abre un manejador
+       (FB_FS_ROOT para "/", sin abrir nada) y contesta a2 = manejador, a3 =
+       longitud y a4 = tipo. Sin manejadores libres, FB_FS_ERR_HANDLES.
+     CREATE: a2 = página, a3 = longitud de la ruta, a4 = tipo. Crea un
+       archivo o un directorio vacío en un directorio que ya existe y
+       contesta a2 = un manejador abierto sobre él. Sin manejadores libres
+       no crea nada (FB_FS_ERR_HANDLES).
+     READ: a2 = manejador, a3 = bloque del archivo, a4 = página de la región.
+       Contesta a2 = bytes del archivo en esa página.
+     WRITE: a2 = manejador, a3 = bloque | bytes << 32, a4 = página.
+     DELETE: a2 = manejador. Un directorio, solo si está vacío. El manejador
+       sigue abierto (y contesta FB_FS_ERR_STALE) hasta que se cierre.
+     RENAME: a2 = manejador, a3 = página, a4 = longitud de la ruta nueva.
+       Puede cambiar de directorio. No sustituye a otra entrada
+       (FB_FS_ERR_EXISTS), y un directorio no puede ir dentro de sí mismo
+       (FB_FS_ERR_REQUEST).
+     LIST: a2 = manejador del directorio, a3 = desde (una entrada), a4 =
+       página. Contesta a2 = el número de la siguiente entrada del
+       directorio desde "desde" (FB_FS_FILES si no hay), a3 = su longitud y
+       a4 = su tipo; su nombre queda en los primeros FB_FS_NAME_BYTES bytes
+       de la página. No abre nada.
+     STAT: a2 = manejador. Contesta a2 = el número de lo que nombra, a3 =
+       longitud y a4 = tipo.
+     CLOSE: a2 = manejador.
+     DETACH: cierra todos los manejadores del cliente.
+     FREE: contesta a2 = bloques libres.
+     STOP: contesta y termina.
+   En a1 contesta un FB_FS_*. Si el disco no tiene formato, toda operación
+   salvo FORMAT contesta FB_FS_ERR_UNFORMATTED; si el superbloque es bueno
+   pero la tabla no (también con un ciclo de directorios), FB_FS_ERR_CORRUPT.
+   Un nombre del medio de la ruta que es un archivo da FB_FS_ERR_NOT_DIR; leer
+   o escribir un directorio, FB_FS_ERR_IS_DIR. Si una escritura de la tabla falla,
+   el servidor deja de atender (FB_FS_ERR_IO) hasta que otro monte el disco:
+   la tabla de memoria ya no es la del disco.
+   Reescribir un bloque escribe en uno libre (copia al escribir), así que
+   necesita un bloque libre: con el disco lleno contesta FB_FS_ERR_FULL. */
+#define FB_FS_OP_STOP 0
+#define FB_FS_OP_FORMAT 1
+#define FB_FS_OP_CREATE 2
+#define FB_FS_OP_LOOKUP 3
+#define FB_FS_OP_READ 4
+#define FB_FS_OP_WRITE 5
+#define FB_FS_OP_DELETE 6
+#define FB_FS_OP_LIST 7
+#define FB_FS_OP_FREE 8
+#define FB_FS_OP_RENAME 9
+#define FB_FS_OP_CLOSE 10
+#define FB_FS_OP_STAT 11
+#define FB_FS_OP_DETACH 12
+#define FB_FS_OK 0
+#define FB_FS_ERR_REQUEST 1
+#define FB_FS_ERR_IO 2
+#define FB_FS_ERR_NOT_FOUND 3
+#define FB_FS_ERR_EXISTS 4
+#define FB_FS_ERR_FULL 5
+#define FB_FS_ERR_UNFORMATTED 6
+#define FB_FS_ERR_CORRUPT 7
+#define FB_FS_ERR_NOT_DIR 8
+#define FB_FS_ERR_NOT_EMPTY 9
+#define FB_FS_ERR_IS_DIR 10
+#define FB_FS_ERR_STALE 11
+#define FB_FS_ERR_BAD_HANDLE 12
+#define FB_FS_ERR_DENIED 13
+#define FB_FS_ERR_HANDLES 14
+#define FB_FS_MAX_OPEN 16
+#define FB_FS_CLIENTS 4
+#define FB_FS_HANDLE_SHIFT 8
+#define FB_FS_KIND_FILE 0
+#define FB_FS_KIND_DIR 1
+#define FB_FS_ROOT 255
+#define FB_FS_PATH_BYTES 256
+#define FB_FS_BLOCKS 256
+#define FB_FS_FIRST_DATA 2
+#define FB_FS_FILES 64
+#define FB_FS_FILE_BLOCKS 16
+#define FB_FS_NAME_BYTES 20
+#define FB_FS_FIRST_SECTOR 2048
+#define FB_FS_META_PAGES 2
+/* Donde el servidor mapea sus metadatos y la región del cliente. */
+#define FB_FS_META_BASE 0x104000000
+#define FB_FS_CLIENT_BASE 0x104010000
 #define FB_PLIC_BASE 0x0c000000
 #define FB_PLIC_SIZE 0x400000UL
 /* CLINT: el supervisor solo puede escribir las palabras msip de los harts
@@ -187,7 +310,10 @@
 #define FB_IPC_NOT_WAITING 1UL
 #define FB_IPC_CANCEL_INVALID 2UL
 
-/* Qué recibió recv en a5. Lo escribe el kernel: un emisor no puede imitarlo. */
+/* Qué recibió recv en a5. Lo escribe el kernel: un emisor no puede imitarlo.
+   En a6 recibe la marca de la capability con que le enviaron (0 sin marca o
+   en una señal). Las marcas solo las pone el kernel al conceder una
+   capability; derivarla o cederla la conserva (Cap_Core). */
 #define FB_MSG_CAP 1
 #define FB_MSG_SIGNAL 2
 #define FB_MSG_CALL 3
@@ -307,6 +433,9 @@ uint64_t fb_uspace_region_free(uint64_t region);
 
 /* Capabilities, demostradas en SPARK. fb_cap_grant es solo para el kernel. */
 uint64_t fb_cap_grant(uint64_t proc, uint64_t slot, uint64_t kind, uint64_t object, uint64_t rights);
+uint64_t fb_cap_grant_badged(uint64_t proc, uint64_t slot, uint64_t kind, uint64_t object, uint64_t rights,
+                             uint64_t badge);
+uint64_t fb_cap_badge(uint64_t proc, uint64_t slot); /* Marca de la capability, o 0. */
 uint64_t fb_cap_check(uint64_t proc, uint64_t slot, uint64_t kind, uint64_t right);
 uint64_t fb_cap_held(uint64_t proc, uint64_t slot);
 uint64_t fb_cap_derive(uint64_t proc, uint64_t src, uint64_t dst, uint64_t rights);
@@ -404,6 +533,64 @@ uint64_t fb_sleep_arm(uint64_t thread, uint64_t deadline);
 uint64_t fb_sleep_disarm(uint64_t thread);
 uint64_t fb_sleep_earliest(void);
 uint64_t fb_sleep_take_expired(uint64_t now);
+
+/* Núcleo del sistema de archivos, demostrado en SPARK (fs_core.ads). Lo
+   enlaza el servidor de archivos; el kernel solo lo usa en sus pruebas. La
+   tabla, los mapas (dueño de cada bloque y profundidad de cada entrada) y
+   el superbloque son del que llama. */
+struct fb_fs_entry {
+    uint8_t used;
+    uint8_t kind;
+    uint8_t parent;
+    uint8_t pad;
+    uint32_t length;
+    uint32_t gen;
+    uint8_t name[20];
+    uint16_t blocks[16];
+};
+struct fb_fs_super {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t blocks;
+    uint32_t files;
+    uint32_t unused;
+};
+struct fb_fs_owner {
+    uint8_t used;
+    uint8_t file;
+    uint8_t slot;
+    uint8_t pad;
+};
+void fb_fs_mount(const struct fb_fs_super *super, const struct fb_fs_entry *table, struct fb_fs_owner *owner, uint8_t *depth, uint64_t *status);
+void fb_fs_format(struct fb_fs_super *super, struct fb_fs_entry *table, struct fb_fs_owner *owner, uint8_t *depth, uint64_t keep);
+void fb_fs_lookup(const struct fb_fs_entry *table, const struct fb_fs_owner *owner, const uint8_t *depth, uint64_t dir, const uint8_t *name, uint64_t *file, uint64_t *status);
+void fb_fs_create(struct fb_fs_entry *table, const struct fb_fs_owner *owner, uint8_t *depth, uint64_t dir, const uint8_t *name, uint64_t kind, uint64_t *file, uint64_t *status);
+void fb_fs_block_of(const struct fb_fs_entry *table, const struct fb_fs_owner *owner, const uint8_t *depth, uint64_t file, uint64_t gen, uint64_t slot, uint64_t *block, uint64_t *bytes, uint64_t *status);
+void fb_fs_plan_write(const struct fb_fs_entry *table, const struct fb_fs_owner *owner, const uint8_t *depth, uint64_t file, uint64_t gen, uint64_t slot, uint64_t bytes, uint64_t *block, uint64_t *status);
+void fb_fs_commit_write(struct fb_fs_entry *table, struct fb_fs_owner *owner, const uint8_t *depth, uint64_t file, uint64_t gen, uint64_t slot, uint64_t bytes, uint64_t block, uint64_t *status);
+void fb_fs_delete(struct fb_fs_entry *table, struct fb_fs_owner *owner, uint8_t *depth, uint64_t file, uint64_t gen, uint64_t *status);
+void fb_fs_rename(struct fb_fs_entry *table, const struct fb_fs_owner *owner, uint8_t *depth, uint64_t file, uint64_t gen, uint64_t dir, const uint8_t *name, uint64_t *status);
+void fb_fs_next_in(const struct fb_fs_entry *table, const struct fb_fs_owner *owner, const uint8_t *depth, uint64_t dir, uint64_t gen, uint64_t from, uint64_t *file, uint64_t *status);
+void fb_fs_stat(const struct fb_fs_entry *table, const struct fb_fs_owner *owner, const uint8_t *depth, uint64_t file, uint64_t gen, uint64_t *kind, uint64_t *length, uint64_t *status);
+uint64_t fb_fs_free_blocks(const struct fb_fs_owner *owner);
+
+/* Manejadores abiertos de cada cliente (fs_handles.ads, Hito 39). */
+struct fb_fs_open {
+    uint32_t used;
+    uint32_t file;
+    uint32_t gen;
+    uint32_t pad;
+};
+struct fb_fs_client {
+    uint64_t badge;
+    struct fb_fs_open opens[16];
+};
+void fb_fs_handles_clear(struct fb_fs_client *table);
+uint64_t fb_fs_room(const struct fb_fs_client *table, uint64_t badge);
+void fb_fs_open(struct fb_fs_client *table, uint64_t badge, uint64_t file, uint64_t gen, uint64_t *handle, uint64_t *status);
+void fb_fs_resolve(const struct fb_fs_client *table, uint64_t badge, uint64_t handle, uint64_t *file, uint64_t *gen, uint64_t *status);
+void fb_fs_close(struct fb_fs_client *table, uint64_t badge, uint64_t handle, uint64_t *status);
+void fb_fs_detach(struct fb_fs_client *table, uint64_t badge);
 
 /* Autopruebas en ensamblador. Devuelven 0 si todo fue bien. */
 uint64_t fb_selftest_callee_saved(void (*call)(void), uint64_t seed);

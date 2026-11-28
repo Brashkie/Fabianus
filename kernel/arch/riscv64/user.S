@@ -631,6 +631,21 @@ BEGIN disk_driver
     .incbin "disk_driver.bin"
 END disk_driver
 
+/* El servidor de archivos (servers/fs, Rust con el núcleo SPARK fs_core) y
+   sus clientes de pruebas (tests/fs_check.rs y, para los cortes de luz,
+   tests/fs_crash.rs). */
+BEGIN fs_server
+    .incbin "fs_server.bin"
+END fs_server
+
+BEGIN fs_check
+    .incbin "fs_check.bin"
+END fs_check
+
+BEGIN fs_crash
+    .incbin "fs_crash.bin"
+END fs_crash
+
 /* Sin capabilities: el dispositivo y sus interrupciones están fuera de alcance. */
 BEGIN device_denied
     li      a0, 0
@@ -1998,13 +2013,13 @@ BEGIN disk_check
     li      s1, 1
     bnez    a0, 9f
 
-    /* Capacidad: 2048 sectores. */
+    /* Capacidad: 4096 sectores. */
     li      s1, 2
     li      s2, 0
     DISK    FB_DISK_OP_CAPACITY, s2, s2
     bnez    a0, 9f
     bnez    a1, 9f
-    li      t0, 2048
+    li      t0, 4096
     bne     a2, t0, 9f
 
     /* Leer los sectores 16 a 23 en la página 0. */
@@ -2069,7 +2084,7 @@ BEGIN disk_check
     /* Una página que no cabe al final del disco y una página que la región
        no tiene: el driver las rechaza. */
     li      s1, 8
-    li      s2, 2044
+    li      s2, 4092
     li      s3, 0
     DISK    FB_DISK_OP_READ, s2, s3
     bnez    a0, 9f
@@ -2163,6 +2178,6 @@ END bench_disk
     .balign 8
     .global fb_user_program_table
 fb_user_program_table:
-    .irp name, hello,registers,spin,isolated,zerocheck,deputy,fault_csr,fault_sret,fault_load_kernel,fault_store_kernel,fault_jump_kernel,fault_store_text,fault_exec_stack,fault_stack_guard,fault_device,bench_syscall,bench_yield,no_caps,cap_rights,console_server,console_client,ping,pong,granter,grantee,ipc_sender,ipc_fifo_receiver,ipc_blocked,bench_ping,bench_pong,uart_driver,device_denied,device_rights,device_touch,device_holder,device_thief,device_exec,uart_client,uart_stopper,uart_reader,uart_loop_client,uart_loop_finish,device_irq_taker,uart_loop_on,bench_write,bench_driver_client,bench_loop_writer,bench_loop_reader,call_client,call_server,call_server_dies,call_expect_peer,send_expect_peer,call_checks,call_server_lost,call_long,call_server_pair,call_once,sched_set,sched_lower,defer_server,go_sender,reply_to_other,defer_then_die,defer_three,defer_then_serve,defer_wait,uart_call_reader,bench_call_read,bench_defer_reader,bench_defer_writer,latency_probe,call_forwarder,sleep_forever,signal_taker,bench_call,bench_serve,bench_xcall,bench_xserve,call_server_spin,shm_writer,shm_reader,shm_store,shm_map_status,shm_map_twice,shm_giver,shm_taker,bench_shm_produce,bench_shm_consume,bench_copy_produce,bench_copy_consume,bench_shm_map,disk_driver,disk_check,dma_status,bench_disk
+    .irp name, hello,registers,spin,isolated,zerocheck,deputy,fault_csr,fault_sret,fault_load_kernel,fault_store_kernel,fault_jump_kernel,fault_store_text,fault_exec_stack,fault_stack_guard,fault_device,bench_syscall,bench_yield,no_caps,cap_rights,console_server,console_client,ping,pong,granter,grantee,ipc_sender,ipc_fifo_receiver,ipc_blocked,bench_ping,bench_pong,uart_driver,device_denied,device_rights,device_touch,device_holder,device_thief,device_exec,uart_client,uart_stopper,uart_reader,uart_loop_client,uart_loop_finish,device_irq_taker,uart_loop_on,bench_write,bench_driver_client,bench_loop_writer,bench_loop_reader,call_client,call_server,call_server_dies,call_expect_peer,send_expect_peer,call_checks,call_server_lost,call_long,call_server_pair,call_once,sched_set,sched_lower,defer_server,go_sender,reply_to_other,defer_then_die,defer_three,defer_then_serve,defer_wait,uart_call_reader,bench_call_read,bench_defer_reader,bench_defer_writer,latency_probe,call_forwarder,sleep_forever,signal_taker,bench_call,bench_serve,bench_xcall,bench_xserve,call_server_spin,shm_writer,shm_reader,shm_store,shm_map_status,shm_map_twice,shm_giver,shm_taker,bench_shm_produce,bench_shm_consume,bench_copy_produce,bench_copy_consume,bench_shm_map,disk_driver,disk_check,dma_status,bench_disk,fs_server,fs_check,fs_crash
     .quad   \name\()_start, \name\()_end
     .endr

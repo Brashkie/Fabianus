@@ -13,6 +13,10 @@
 //! el servidor trabaja con el contexto de planificación del cliente hasta que
 //! le responde: su prioridad y su presupuesto.
 //!
+//! Quien recibe un mensaje encuentra en a6 la marca de la capability con que
+//! se lo enviaron (Cap_Core.Badge_Of; 0 en una señal). Solo el kernel pone
+//! marcas, así que un servidor sabe qué cliente le habla.
+//!
 //! Quien recibe una llamada lo sabe por FB_MSG_CALL en a5. Puede contestar ya o
 //! aplazarla con defer, que devuelve en a1 el cliente; más tarde la contesta con
 //! reply_to(cliente=a0, mensaje=a1..a4). Mientras tanto puede recibir otras.
@@ -31,9 +35,14 @@ const a2: usize = 12;
 const a3: usize = 13;
 const a4: usize = 14;
 const a5: usize = 15;
+const a6: usize = 16;
 
 /// Marco del trap de cada hilo mientras espera en un endpoint o una respuesta.
 var waiting: [thread.max_threads]?*abi.fb_trap_frame = [_]?*abi.fb_trap_frame{null} ** thread.max_threads;
+
+/// Marca de la capability con que envió cada hilo que espera a su receptor.
+/// Se toma al enviar: es la de ese momento aunque después cambie el hueco.
+var sent_badge = [_]u64{0} ** thread.max_threads;
 
 /// Servidores que pueden tener respuestas aplazadas. Solo dice dónde buscar: la
 /// búsqueda lo borra cuando ya no queda ninguna.
@@ -168,6 +177,7 @@ fn endpointOf(space: u64, cap: u64, right: u64) ?u64 {
 fn deliver(sender: *abi.fb_trap_frame, sender_id: u64, receiver: *abi.fb_trap_frame, receiver_id: u64) void {
     const destination = receiver.regs[a1];
     const offered = sender.regs[a5];
+    receiver.regs[a6] = sent_badge[sender_id];
 
     receiver.regs[a1] = sender.regs[a1];
     receiver.regs[a2] = sender.regs[a2];
@@ -195,6 +205,7 @@ fn deliverSignal(receiver: *abi.fb_trap_frame) void {
     receiver.regs[a3] = 0;
     receiver.regs[a4] = 0;
     receiver.regs[a5] = abi.FB_MSG_SIGNAL;
+    receiver.regs[a6] = 0;
 }
 
 fn takeWaiting(id: u64) *abi.fb_trap_frame {
@@ -251,6 +262,7 @@ pub fn send(frame: *abi.fb_trap_frame) u64 {
         if (abi.fb_cap_held(space, offered) == 0) return abi.FB_ERR_CAP;
     }
 
+    sent_badge[id] = abi.fb_cap_badge(space, frame.regs[a0]);
     const peer = abi.fb_ipc_send(endpoint, id);
     if (peer == abi.FB_IPC_INVALID) return abi.FB_ERR_INVALID;
     if (peer == abi.FB_IPC_QUEUED) return wait(frame, id);
@@ -279,9 +291,11 @@ pub fn recv(frame: *abi.fb_trap_frame) u64 {
 /// Como send, pero sin esperar y sin ceder capabilities.
 pub fn trySend(frame: *abi.fb_trap_frame) u64 {
     const id = thread.currentId();
-    const endpoint = endpointOf(process.currentSpace(), frame.regs[a0], abi.FB_RIGHT_SEND) orelse return abi.FB_ERR_CAP;
+    const space = process.currentSpace();
+    const endpoint = endpointOf(space, frame.regs[a0], abi.FB_RIGHT_SEND) orelse return abi.FB_ERR_CAP;
     if (frame.regs[a5] != abi.FB_CAP_SLOT_NONE) return abi.FB_ERR_INVALID;
 
+    sent_badge[id] = abi.fb_cap_badge(space, frame.regs[a0]);
     const peer = abi.fb_ipc_try_send(endpoint);
     if (peer == abi.FB_IPC_INVALID) return abi.FB_ERR_INVALID;
     if (peer == abi.FB_IPC_NOT_READY) return abi.FB_ERR_NOT_READY;
@@ -294,9 +308,11 @@ pub fn trySend(frame: *abi.fb_trap_frame) u64 {
 /// Envía y espera la respuesta. Una llamada no puede ceder capabilities.
 pub fn call(frame: *abi.fb_trap_frame) u64 {
     const id = thread.currentId();
-    const endpoint = endpointOf(process.currentSpace(), frame.regs[a0], abi.FB_RIGHT_SEND) orelse return abi.FB_ERR_CAP;
+    const space = process.currentSpace();
+    const endpoint = endpointOf(space, frame.regs[a0], abi.FB_RIGHT_SEND) orelse return abi.FB_ERR_CAP;
     if (frame.regs[a5] != abi.FB_CAP_SLOT_NONE) return abi.FB_ERR_INVALID;
 
+    sent_badge[id] = abi.fb_cap_badge(space, frame.regs[a0]);
     const peer = abi.fb_ipc_call(endpoint, id);
     if (peer == abi.FB_IPC_INVALID) return abi.FB_ERR_INVALID;
     if (peer == abi.FB_IPC_QUEUED) return wait(frame, id);

@@ -124,3 +124,27 @@ memmove:
 2:
     ret
     .size memmove, . - memmove
+
+/*
+ * memcmp: diferencia del primer byte distinto, sin signo, como pide C. El
+ * código SPARK la usa para comparar arrays (los nombres de los archivos). Va
+ * byte a byte: los nombres miden 24 bytes y casi siempre difieren al
+ * principio.
+ */
+    .global memcmp
+    .type memcmp, @function
+memcmp:
+    add     t0, a0, a2
+1:
+    beq     a0, t0, 2f
+    lbu     t1, 0(a0)
+    lbu     t2, 0(a1)
+    addi    a0, a0, 1
+    addi    a1, a1, 1
+    beq     t1, t2, 1b
+    sub     a0, t1, t2
+    ret
+2:
+    li      a0, 0
+    ret
+    .size memcmp, . - memcmp

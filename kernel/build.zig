@@ -2,6 +2,10 @@
 const std = @import("std");
 
 const Crash = enum { none, panic, trap, stack, thread_stack };
+/// Cortes de luz de verdad (Hito 36): `run` repite la carga del sistema de
+/// archivos sin fin, para matar QEMU en cualquier momento; `check` monta el
+/// disco que quedó y comprueba que está en un estado de la carga.
+const FsKill = enum { none, run, check };
 
 pub fn build(b: *std.Build) void {
     // rv64imac con Sstc: el kernel no usa coma flotante.
@@ -30,6 +34,8 @@ pub fn build(b: *std.Build) void {
     const bench = b.option(bool, "bench", "Ejecuta el benchmark en lugar de las autopruebas") orelse false;
     options.addOption(bool, "bench", bench);
     options.addOption(u64, "harts", harts);
+    const fskill = b.option(FsKill, "fskill", "Arranca para la prueba de cortes de luz matando QEMU") orelse .none;
+    options.addOption(FsKill, "fskill", fskill);
 
     const kernel_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -106,6 +112,61 @@ pub fn build(b: *std.Build) void {
     });
     kernel_module.addIncludePath(disk_driver_image.getOutput().dirname());
 
+    // Biblioteca común de los programas de usuario en Rust (lib/fb_user).
+    const rust_user = b.addSystemCommand(&rust_flags);
+    rust_user.addArgs(&.{ "--crate-type=rlib", "--crate-name=fb_user" });
+    rust_user.addFileArg(b.path("lib/fb_user/lib.rs"));
+    rust_user.addPrefixedFileArg("--extern=fb_abi=", rust_abi_library);
+    rust_user.addArg("-o");
+    const rust_user_library = rust_user.addOutputFileArg("libfb_user.rlib");
+
+    // El servidor de archivos: Rust y, enlazado en la misma imagen, el núcleo
+    // demostrado en SPARK (fs_core). Por eso necesita la biblioteca SPARK.
+    const fs_server = b.addSystemCommand(&rust_flags);
+    fs_server.addArgs(&.{ "--crate-type=bin", "--crate-name=fs_server" });
+    fs_server.addFileArg(b.path("servers/fs/main.rs"));
+    fs_server.addPrefixedFileArg("--extern=fb_abi=", rust_abi_library);
+    fs_server.addPrefixedFileArg("--extern=fb_user=", rust_user_library);
+    fs_server.addPrefixedFileArg("-Clink-arg=-T", b.path("drivers/uart/driver.ld"));
+    fs_server.addPrefixedFileArg("-Clink-arg=", b.path("spark/lib/libfabianus_core.a"));
+    fs_server.addArg("-o");
+    const fs_server_elf = fs_server.addOutputFileArg("fs_server.elf");
+    b.getInstallStep().dependOn(&b.addInstallBinFile(fs_server_elf, "fs_server.elf").step);
+    const fs_server_image = b.addObjCopy(fs_server_elf, .{
+        .basename = "fs_server.bin",
+        .format = .bin,
+    });
+    kernel_module.addIncludePath(fs_server_image.getOutput().dirname());
+
+    // Su cliente de pruebas, también en Rust.
+    const fs_check = b.addSystemCommand(&rust_flags);
+    fs_check.addArgs(&.{ "--crate-type=bin", "--crate-name=fs_check" });
+    fs_check.addFileArg(b.path("tests/fs_check.rs"));
+    fs_check.addPrefixedFileArg("--extern=fb_abi=", rust_abi_library);
+    fs_check.addPrefixedFileArg("--extern=fb_user=", rust_user_library);
+    fs_check.addPrefixedFileArg("-Clink-arg=-T", b.path("drivers/uart/driver.ld"));
+    fs_check.addArg("-o");
+    const fs_check_elf = fs_check.addOutputFileArg("fs_check.elf");
+    const fs_check_image = b.addObjCopy(fs_check_elf, .{
+        .basename = "fs_check.bin",
+        .format = .bin,
+    });
+    kernel_module.addIncludePath(fs_check_image.getOutput().dirname());
+
+    const fs_crash = b.addSystemCommand(&rust_flags);
+    fs_crash.addArgs(&.{ "--crate-type=bin", "--crate-name=fs_crash" });
+    fs_crash.addFileArg(b.path("tests/fs_crash.rs"));
+    fs_crash.addPrefixedFileArg("--extern=fb_abi=", rust_abi_library);
+    fs_crash.addPrefixedFileArg("--extern=fb_user=", rust_user_library);
+    fs_crash.addPrefixedFileArg("-Clink-arg=-T", b.path("drivers/uart/driver.ld"));
+    fs_crash.addArg("-o");
+    const fs_crash_elf = fs_crash.addOutputFileArg("fs_crash.elf");
+    const fs_crash_image = b.addObjCopy(fs_crash_elf, .{
+        .basename = "fs_crash.bin",
+        .format = .bin,
+    });
+    kernel_module.addIncludePath(fs_crash_image.getOutput().dirname());
+
     // La imagen del disco de pruebas, con un patrón conocido (tools/mkdisk.zig).
     const mkdisk = b.addExecutable(.{ .name = "mkdisk", .root_module = b.createModule(.{
         .root_source_file = b.path("tools/mkdisk.zig"),
@@ -135,6 +196,7 @@ pub fn build(b: *std.Build) void {
     spark_build.has_side_effects = true;
     spark_build.step.dependOn(&spark_prove.step);
     kernel.step.dependOn(&spark_build.step);
+    fs_server.step.dependOn(&spark_build.step);
     kernel.addObjectFile(b.path("spark/lib/libfabianus_core.a"));
 
     const prove_report = b.addSystemCommand(&(.{ alr, "-n", "exec", "--", "gnatprove", "-P", "fabianus_core.gpr", "--report=all" } ++ prove_switches));

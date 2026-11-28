@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Genera la imagen del disco de pruebas: 2048 sectores de 512 bytes (1 MiB).
+//! Genera la imagen del disco de pruebas: 4096 sectores de 512 bytes (2 MiB).
+//! El segundo MiB es el del sistema de archivos (FB_FS_FIRST_SECTOR): con el
+//! mismo patrón, que no es un sistema de archivos válido, el servidor lo
+//! encuentra sin formatear.
 //! La palabra i (de 8 bytes, little endian) del sector s vale s * 2^32 + i,
 //! así que cualquier lectura se puede comprobar sin guardar una copia.
 //! QEMU la abre con snapshot=on: lo que escriben las pruebas se pierde al
@@ -7,7 +10,7 @@
 
 const std = @import("std");
 
-pub const sectors: u64 = 2048;
+pub const sectors: u64 = 4096;
 pub const sector_bytes: u64 = 512;
 
 pub fn main() !void {

@@ -84,6 +84,8 @@ fn recv(cap: u64) -> Message {
             lateout("a3") a3,
             lateout("a4") a4,
             lateout("a5") kind,
+            // La marca de quien envía (Hito 39): este driver no la usa.
+            lateout("a6") _,
             options(nostack),
         );
     }
